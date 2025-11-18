@@ -328,6 +328,7 @@ class ChatOrchestrator:
         return any(k in t for k in keywords)
 
     # -------------------- Router for user free text --------------------
+        # -------------------- Router for user free text --------------------
     def handle(self, user_text: str, state: Dict[str, Any]) -> Dict[str, Any]:
         """
         Conversation brain:
@@ -370,36 +371,51 @@ class ChatOrchestrator:
         def wants_tune(t: str) -> bool:
             return any(w in t for w in ["tune", "tuning", "optimize", "improve model", "hyperparameter"])
 
-        # -------------------- GLOBAL TUNING INTENT --------------------
-        # If the user says they want to tune (in natural language), always try
-        # to move them into the tuning flow, regardless of current stage.
-        if wants_tune(text):
-            # 1) Training has NOT happened yet → explain requirement and send them to training.
-            if st.get("train_result") is None:
+        # -------- GLOBAL handling of direct "tune" requests --------
+        # User can say "tune the model" / "go to tuning part" at ANY time.
+        if wants_tune(text) and tuning_stage is None:
+            # 1) If training has NOT been done yet -> explain that training is required first.
+            if not st.get("train_result"):
                 st["messages"].append(
                     {
                         "role": "assistant",
                         "content": (
-                            "Hyperparameter tuning comes **after** training.\n\n"
-                            "Please first select a **target column** and run **Train baselines**. "
-                            "Once the baseline models are trained, you can say **tune the model** again "
-                            "and I’ll start the tuning process for you."
+                            "Hyperparameter tuning comes **after training**.\n\n"
+                            "Please first choose a **target column** and click **Train baselines** "
+                            "in the training panel below. Once training finishes, "
+                            "you can say **tune the model** again and I’ll start the tuning process."
                         ),
                     }
                 )
-                # If we already have data, move user visually towards the training section.
-                df_for_train = st.get("pre_df") if st.get("pre_df") is not None else st.get("clean_df")
-                if isinstance(df_for_train, pd.DataFrame):
-                    st["stage"] = "preview_download"
-                    st["show_only_preview"] = False
                 return st
 
-            # 2) Training is done but no tuning chat active yet → show consent prompt.
-            if tuning_stage is None:
-                st = self.ask_tuning_opt_in(st)
-                return st
-            # 3) If we're already inside a tuning stage, let the stage-specific
-            #    handlers below process this message (no early return here).
+            # 2) Training is done -> jump directly into the tuning conversation
+            task = st.get("task_type", "classification")
+            suggested = "f1" if task == "classification" else "r2"
+
+            # Recommend a method + short explanation
+            method, reason = self._recommend_tuning(st)
+            methods_brief = self._tuning_methods_brief()
+            st["chosen_tune_method"] = method
+            st["tuning_stage"] = "choose_metric"
+            human_label = "Bayesian optimization" if method == "bayesian" else "Random search"
+
+            st["messages"].append(
+                {
+                    "role": "assistant",
+                    "content": (
+                        "Great, we can proceed with **hyperparameter tuning**.\n\n"
+                        f"Here’s a quick comparison of tuning methods:\n\n{methods_brief}\n\n"
+                        f"For your situation, I’d recommend **{human_label}** — {reason}\n\n"
+                        f"I’ll use safe defaults and **{human_label}**.\n\n"
+                        f"Which **metric** should I optimize? (e.g., **{suggested}**)\n"
+                        "- Classification: `f1`, `accuracy`, `precision`, `recall`\n"
+                        "- Regression: `r2`, `rmse`, `mae`\n\n"
+                        "_You can also say **random search** if you prefer that method._"
+                    ),
+                }
+            )
+            return st
 
         # -------------------- TUNING: consent → metric → auto-run --------------------
         if tuning_stage == "ask_consent":
