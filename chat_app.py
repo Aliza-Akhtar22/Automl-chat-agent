@@ -98,6 +98,7 @@ for msg in MESSAGES_TO_RENDER:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
+
 # ---------- Helpers: per-step inline UI ----------
 def ui_missing():
     df = S["clean_df"]
@@ -345,7 +346,7 @@ def maybe_answer_qa(user_text: str, state: dict) -> str | None:
     txt = (user_text or "").strip().lower()
 
     # 🧭 If the text clearly looks like a *navigation / action* command,
-    # let the orchestrator handle it (preview, train, go to preprocess, etc.)
+    # let the orchestrator handle it (preview, train, preprocess, tuning, etc.)
     nav_keywords = [
         "show me the data preview",
         "show me preview",
@@ -369,6 +370,25 @@ def maybe_answer_qa(user_text: str, state: dict) -> str | None:
         "go to preprocess part",
     ]
     if any(k in txt for k in nav_keywords) or txt.strip() in {"preview"}:
+        return None
+
+    # NEW: tuning / hyperparameter navigation is always handled by the orchestrator
+    tune_nav_keywords = [
+        "tune",
+        "tuning",
+        "hyperparameter",
+        "hyper parameter",
+        "hyperparameter tuning",
+        "hyper parameter tuning",
+        "proceed with tuning",
+        "start tuning",
+        "go to tuning",
+        "optimize the model",
+        "optimize model",
+        "improve the model",
+        "improve model",
+    ]
+    if any(k in txt for k in tune_nav_keywords):
         return None
 
     # Heuristic: looks like a question?
