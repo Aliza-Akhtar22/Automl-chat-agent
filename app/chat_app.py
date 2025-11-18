@@ -15,7 +15,7 @@ from app.agents.nodes import choose_task_type  # only for quick local detection
 from app.agents.runner import run_automl_graph
 from app.core.utils import best_model_by_task
 from app.agents.llm_utils import chat_once
-from app.agents.prompts import SYSTEM_QA_AGENT  # 👈 Q&A prompt
+from app.agents.prompts import SYSTEM_QA_AGENT  # Q&A prompt
 
 # ---------- Page ----------
 st.set_page_config(page_title="Chat AutoML", layout="wide")
