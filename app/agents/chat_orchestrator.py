@@ -9,8 +9,10 @@ import numpy as np
 from app.agents.llm_utils import chat_once
 from app.agents.prompts import SYSTEM_DATA_SUMMARY, SYSTEM_QA_AGENT
 from app.core.preprocessing import coerce_nulls, missing_report, dtypes_dict
-from app.core.utils import best_model_by_task
+from app.core.utils import best_model_by_task # ✅ added detect_task_type
+from app.agents.nodes import choose_task_type
 from app.agents.runner import run_automl_graph
+from app.agents.planner_agent import make_plan  # ✅ NEW: planner
 
 
 # --------------- Conversation Stages ---------------
@@ -106,6 +108,9 @@ class ChatOrchestrator:
         st["require_approval"] = False
         st["approved"] = False
         st["supervisor_reason"] = ""
+
+        # Planner-related scratch
+        st.setdefault("last_plan", None)
 
         st["last_bot"] = None
         return st
@@ -327,6 +332,328 @@ class ChatOrchestrator:
         ]
         return any(k in t for k in keywords)
 
+    # -------------------- Planner helpers --------------------
+    def _looks_like_full_pipeline(self, text: str) -> bool:
+        """
+        Detect high-level "do everything end-to-end" requests where the Planner should be used.
+        Examples:
+          - "Just do everything end to end"
+          - "Clean the data, train the model and tune the best one"
+          - "Please run the full automl pipeline for me"
+          - "From upload to the best tuned model, do the whole thing"
+        """
+        t = text.lower()
+
+        trigger_phrases = [
+            "end to end",
+            "end-to-end",
+            "full pipeline",
+            "full automl",
+            "full auto ml",
+            "do everything",
+            "do the whole thing",
+            "do the whole pipeline",
+            "run everything",
+            "run the whole",
+            "run the entire",
+            "whole thing",
+            "entire thing",
+            "from upload to the best tuned model",
+        ]
+        if any(p in t for p in trigger_phrases):
+            return True
+
+        # soft pattern: mentions clean/preprocess + train + tune/optimize
+        has_clean = any(w in t for w in ["clean", "preprocess", "pre-processing"])
+        has_train = "train" in t or "training" in t
+        has_tune = any(w in t for w in ["tune", "tuning", "optimize", "hyperparameter"])
+        if has_clean and has_train and has_tune:
+            return True
+
+        # generic "run automl for me" style
+        if "automl" in t and any(w in t for w in ["run", "do", "everything", "pipeline"]):
+            return True
+
+        return False
+
+    def _execute_plan_preprocess(self, st: Dict[str, Any], args: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Planner step: preprocessing.
+        Uses the existing run_preprocess_now (graph + tools).
+        """
+        if st.get("clean_df") is None:
+            st["messages"].append(
+                {
+                    "role": "assistant",
+                    "content": (
+                        "I wanted to start with **preprocessing**, but I don't see any data yet. "
+                        "Please upload a CSV first."
+                    ),
+                }
+            )
+            return st
+
+        out = self.run_preprocess_now(st)
+        out["stage"] = "preview_download"
+        out["show_only_preview"] = True
+        out["messages"].append(
+            {
+                "role": "assistant",
+                "content": (
+                    "✅ Step: **Preprocessing** completed using the current configuration. "
+                    "You can review the preview / download section below."
+                ),
+            }
+        )
+        return out
+
+    def _execute_plan_train(self, st: Dict[str, Any], args: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Planner step: training.
+        Requires a target column (from args or from existing state).
+        """
+        st = st.copy()
+
+        # Decide which DataFrame to use
+        df_for_train = st.get("pre_df") if st.get("pre_df") is not None else st.get("clean_df")
+        if df_for_train is None:
+            st["messages"].append(
+                {
+                    "role": "assistant",
+                    "content": (
+                        "I tried to start **training**, but there is no data available yet. "
+                        "Please upload and preprocess the data first."
+                    ),
+                }
+            )
+            return st
+
+        target = (args or {}).get("target") or st.get("target_col")
+        if not target:
+            st["messages"].append(
+                {
+                    "role": "assistant",
+                    "content": (
+                        "To run **training** end-to-end I need to know your **target column** "
+                        "(the value you want to predict).\n\n"
+                        "Please select the target column in the **Train baselines** panel, "
+                        "or tell me its exact column name in chat."
+                    ),
+                }
+            )
+            return st
+
+        if target not in df_for_train.columns:
+            st["messages"].append(
+                {
+                    "role": "assistant",
+                    "content": (
+                        f"I couldn’t find a column named **{target}** in your dataset. "
+                        "Please double-check the column name and try again."
+                    ),
+                }
+            )
+            return st
+
+        st["target_col"] = target
+        # Auto-detect task if not already set
+        try:
+            y = df_for_train[target]
+            st["task_type"] = st.get("task_type") or choose_task_type(y)
+        except Exception:
+            st.setdefault("task_type", "classification")
+
+        st["want_train"] = True
+        st["approved"] = True
+
+        out = run_automl_graph(st)
+
+        if out.get("train_result") is not None:
+            out["messages"].append(
+                {
+                    "role": "assistant",
+                    "content": (
+                        f"✅ Step: **Training** completed on target **{target}**. "
+                        "You can view the leaderboard and recommended best model below."
+                    ),
+                }
+            )
+        else:
+            out["messages"].append(
+                {
+                    "role": "assistant",
+                    "content": (
+                        "I tried to run **training**, but it didn’t complete. "
+                        "Please check the **errors/history** panel above, or try again."
+                    ),
+                }
+            )
+
+        return out
+
+    def _execute_plan_tune(self, st: Dict[str, Any], args: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Planner step: hyperparameter tuning.
+        Uses defaults if metric/method are not specified in the plan.
+        """
+        st = st.copy()
+
+        if not st.get("train_result"):
+            st["messages"].append(
+                {
+                    "role": "assistant",
+                    "content": (
+                        "I wanted to run **hyperparameter tuning**, but I don’t see any trained models yet. "
+                        "We need to finish baseline training first."
+                    ),
+                }
+            )
+            return st
+
+        task = st.get("task_type", "classification")
+        metric = (args or {}).get("metric", "auto")
+        if metric in (None, "", "auto"):
+            metric = "f1" if task == "classification" else "r2"
+
+        method = (args or {}).get("method") or (args or {}).get("tune_method") or st.get("chosen_tune_method")
+        if method not in {"bayesian", "random_search"}:
+            # Use the same recommendation logic you use in the chat flow
+            method, _reason = self._recommend_tuning(st)
+
+        st["tune_metric"] = metric
+        st["chosen_tune_method"] = method
+        st["want_tune"] = True
+        st["approved"] = True  # already got "do everything" consent via planner
+
+        out = run_automl_graph(st)
+
+        if out.get("tuned_result"):
+            tr = out["tuned_result"]
+            best_params = tr.get("best_params", {})
+            test_metrics = tr.get("test_metrics", {})
+            method_label = "Bayesian optimization" if out.get("chosen_tune_method") == "bayesian" else "Random search"
+            out["messages"].append(
+                {
+                    "role": "assistant",
+                    "content": (
+                        f"✅ Step: **Tuning** complete with **{method_label}** optimizing **{metric}**.\n\n"
+                        f"**Best params:** `{best_params}`\n\n"
+                        f"**Test metrics:** `{test_metrics}`"
+                    ),
+                }
+            )
+        else:
+            out["messages"].append(
+                {
+                    "role": "assistant",
+                    "content": (
+                        "I tried to run **tuning**, but it didn’t complete. "
+                        "Please check the **errors/history** panel above, or try again."
+                    ),
+                }
+            )
+
+        return out
+
+    def _run_plan(self, user_text: str, st: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Main planner entry:
+        - Calls LLM planner to build a plan.
+        - Executes each step via the supervisor/graph.
+        - Adds a final natural-language summary at the end.
+        """
+        if st.get("clean_df") is None:
+            st["messages"].append(
+                {
+                    "role": "assistant",
+                    "content": (
+                        "I can absolutely run the full **end-to-end AutoML pipeline**, "
+                        "but first I need a dataset. Please upload a CSV, then repeat your request."
+                    ),
+                }
+            )
+            return st
+
+        # 1) Call planner LLM
+        plan = make_plan(user_text)
+        steps = plan.get("steps") or []
+        st["last_plan"] = plan
+
+        # 2) Show the high-level plan to the user
+        bullets = []
+        for i, step in enumerate(steps, start=1):
+            action = (step.get("action") or "").lower()
+            if action == "preprocess":
+                label = "Preprocess / clean the data"
+            elif action == "train":
+                label = "Train baseline models and build a leaderboard"
+            elif action == "tune":
+                label = "Tune the best model’s hyperparameters"
+            else:
+                label = f"Custom step: {action or '(unknown)'}"
+            bullets.append(f"{i}. {label}")
+
+        plan_text = "\n".join(bullets) if bullets else "No valid steps were produced."
+        st["messages"].append(
+            {
+                "role": "assistant",
+                "content": (
+                    "Got it — I’ll treat this as a **full AutoML workflow** and follow this plan:\n\n"
+                    f"{plan_text}\n\n"
+                    "I’ll run the steps one by one and then give you a summary of what happened."
+                ),
+            }
+        )
+
+        current = st
+        # 3) Execute each step via graph/tools
+        for idx, step in enumerate(steps, start=1):
+            action = (step.get("action") or "").lower()
+            args = step.get("args") or {}
+
+            if action == "preprocess":
+                current = self._execute_plan_preprocess(current, args)
+            elif action == "train":
+                current = self._execute_plan_train(current, args)
+            elif action == "tune":
+                current = self._execute_plan_tune(current, args)
+            else:
+                current["messages"].append(
+                    {
+                        "role": "assistant",
+                        "content": (
+                            f"I’m skipping unknown planner step `{action}`. "
+                            "You can handle this part manually if needed."
+                        ),
+                    }
+                )
+
+        # 4) Final summary over the current state
+        try:
+            summary_question = (
+                "Please summarize, in friendly plain English, what steps have been completed "
+                "(preprocessing, training, tuning) and highlight the current best model and key metrics "
+                "for the user. Use short paragraphs or bullet points."
+            )
+            summary = self._qa_answer(summary_question, current)
+        except Exception:
+            summary = (
+                "End-to-end run finished. You can review the preprocessing choices, "
+                "training leaderboard, and (if available) tuning results in the panels above."
+            )
+
+        current["messages"].append(
+            {
+                "role": "assistant",
+                "content": (
+                    "🧾 **End-to-end run summary**\n\n"
+                    f"{summary}"
+                ),
+            }
+        )
+
+        return current
+
     # -------------------- Router for user free text --------------------
     def handle(self, user_text: str, state: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -337,6 +664,8 @@ class ChatOrchestrator:
         - Preprocess execution is triggered separately by UI preview (run_preprocess_now).
         - If the message looks like a *question*, route to the QA helper instead of
           just saying "use the controls above".
+        - NEW: if the message looks like a **full pipeline** request, call the Planner
+          to build a plan and let the supervisor execute it step by step.
         """
         st = state.copy()
         st["last_bot"] = None
@@ -344,6 +673,10 @@ class ChatOrchestrator:
         stage = st.get("stage", "await_upload")
         tuning_stage = st.get("tuning_stage")
         text = (user_text or "").strip().lower()
+
+        # ---------- NEW: Planner hook for full end-to-end requests ----------
+        if self._looks_like_full_pipeline(text):
+            return self._run_plan(user_text, st)
 
         def wants_preview(t: str) -> bool:
             preview_words = ["preview", "show preview", "see preview", "download", "show data", "see data", "show table"]

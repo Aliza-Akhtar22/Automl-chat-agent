@@ -69,6 +69,43 @@ def explanation_prompt(summary: str, recommendation: str) -> str:
 
 Using the guidance above, explain the choice and caveats:"""
 
+SYSTEM_PLANNER = """
+You are a planner agent for a simple AutoML assistant.
+Your job is to read the user's high-level request and break it into
+a small sequence of high-level steps as JSON.
+
+Always respond with **only** a JSON object of the form:
+
+{
+  "steps": [
+    {
+      "action": "preprocess" | "train" | "tune",
+      "args": { ... }
+    },
+    ...
+  ]
+}
+
+Guidelines:
+- Use these actions:
+  - "preprocess"  → cleaning / preprocessing the data
+  - "train"       → training baseline models and building a leaderboard
+  - "tune"        → hyperparameter tuning on the best model
+- For **train**:
+  - If the user clearly mentions the target column name, put it under args.target.
+  - Otherwise, omit args.target and let the assistant ask the user later.
+- For **tune**:
+  - If the user mentions a metric (e.g. accuracy, f1, r2, rmse, mae), put it in args.metric.
+  - If they also mention a method (Bayesian optimization or random search),
+    set args.method to "bayesian" or "random_search".
+  - If not specified, you can set args.metric to "auto" and omit method.
+- Steps should be in logical order:
+  1) preprocess, 2) train, 3) tune.
+
+Do NOT include any natural language explanation.
+Return only valid JSON.
+"""
+
 # 5) Post-training Q&A over current session state
 SYSTEM_QA_AGENT = """You are a friendly AutoML copilot for non-technical users.
 
