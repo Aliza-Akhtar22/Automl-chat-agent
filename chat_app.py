@@ -353,14 +353,16 @@ def _df_for_training():
 
 # ------------ Q&A helper over current state ------------
 def maybe_answer_qa(user_text: str, state: dict) -> str | None:
-    """
-    If the user is asking a question about metrics / status / preprocessing / tuning,
-    answer it via LLM using SYSTEM_QA_AGENT. Otherwise return None.
+    txt = (user_text or "").strip().lower()
 
-    NOTE (planner): if planner is actively running AND waiting for a target,
-    don't route to QA here; let orchestrator handle the target gating.
-    """
-    if state.get("plan_active") and state.get("require_target_col"):
+    # 0) If it looks like an ACTION / WORKFLOW request, do NOT treat as QA.
+    action_triggers = [
+        "do everything", "end to end", "end-to-end", "full pipeline", "full automl",
+        "run automl", "clean the data", "preprocess", "pre-processing",
+        "train", "training", "tune", "tuning", "optimize", "hyperparameter",
+        "do preprocess and training", "preprocess and train", "from upload to"
+    ]
+    if any(k in txt for k in action_triggers) and "?" not in txt:
         return None
 
     txt = (user_text or "").strip().lower()

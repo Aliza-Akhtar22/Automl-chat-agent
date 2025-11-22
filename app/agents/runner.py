@@ -1,63 +1,39 @@
 # app/agents/runner.py
 from __future__ import annotations
-
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 from app.agents.graph import build_automl_graph
 
 _app = build_automl_graph()
 
-
-def _fingerprint(state: Dict[str, Any]) -> Dict[str, Any]:
+def _snapshot_key(s: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Create a lightweight, JSON-safe snapshot of state, excluding DataFrames
-    and other un-comparable objects. This is used to detect convergence
-    in the runner loop.
+    Build a safe, comparable snapshot that does NOT include DataFrames
+    (or any pandas objects). Only scalars/booleans/lengths.
     """
-    def has_df(x: Any) -> bool:
-        # Avoid importing pandas here; just detect by common attributes
-        return hasattr(x, "shape") and hasattr(x, "columns")
-
-    fp: Dict[str, Any] = {
-        # presence flags (not the objects)
-        "has_clean_df": state.get("clean_df") is not None and has_df(state.get("clean_df")),
-        "has_pre_df": state.get("pre_df") is not None and has_df(state.get("pre_df")),
-        "has_train_result": bool(state.get("train_result")),
-        "has_tuned_result": bool(state.get("tuned_result")),
-
-        # routing flags
-        "want_preprocess": bool(state.get("want_preprocess")),
-        "want_train": bool(state.get("want_train")),
-        "want_tune": bool(state.get("want_tune")),
-
-        # key scalar fields
-        "target_col": state.get("target_col"),
-        "task_type": state.get("task_type"),
-        "chosen_tune_method": state.get("chosen_tune_method"),
-        "tune_metric": state.get("tune_metric"),
-
-        # approval gates
-        "require_approval": bool(state.get("require_approval")),
-        "approved": bool(state.get("approved")),
+    plan_steps = s.get("plan_steps") or []
+    return {
+        "has_clean_df": s.get("clean_df") is not None,
+        "has_pre_df": s.get("pre_df") is not None,
+        "has_train_result": bool(s.get("train_result")),
+        "has_tuned_result": bool(s.get("tuned_result")),
+        "want_preprocess": bool(s.get("want_preprocess")),
+        "want_train": bool(s.get("want_train")),
+        "want_tune": bool(s.get("want_tune")),
+        "require_approval": bool(s.get("require_approval")),
+        "approved": bool(s.get("approved")),
+        "plan_len": len(plan_steps),
+        "plan_index": int(s.get("plan_index") or 0),
+        "plan_done": bool(s.get("plan_done")),
+        "errors_len": len(s.get("errors") or []),
+        "history_len": len(s.get("history") or []),
+        "target_col": s.get("target_col"),
+        "task_type": s.get("task_type"),
     }
 
-    # Optional: include shapes if you want extra safety
-    try:
-        if fp["has_clean_df"]:
-            fp["clean_shape"] = tuple(state["clean_df"].shape)  # type: ignore
-        if fp["has_pre_df"]:
-            fp["pre_shape"] = tuple(state["pre_df"].shape)      # type: ignore
-    except Exception:
-        pass
-
-    return fp
-
-
-def run_automl_graph(state: Dict[str, Any], max_loops: int = 6) -> Dict[str, Any]:
+def run_automl_graph(state: Dict[str, Any]) -> Dict[str, Any]:
     """
     Runs the AutoML graph/safe runner with given state.
-    Re-invokes the graph until the high-level fingerprint stops changing
-    or we hit max_loops. This allows sequential execution (preprocess -> train -> tune)
-    within one user action without comparing DataFrames directly.
+    Loops to complete deterministic workflows (plan_steps or explicit flags).
     """
     base = dict(state)
     cfg = {
@@ -67,10 +43,11 @@ def run_automl_graph(state: Dict[str, Any], max_loops: int = 6) -> Dict[str, Any
         }
     }
 
-    last_fp: Optional[Dict[str, Any]] = None
-    current = base
+    current = dict(base)
+    last_snap = None
 
-    for _ in range(max_loops):
+    # up to 8 sequential invocations to finish plans/flags
+    for _ in range(8):
         try:
             out = _app.invoke(current, config=cfg)
         except TypeError:
@@ -82,23 +59,26 @@ def run_automl_graph(state: Dict[str, Any], max_loops: int = 6) -> Dict[str, Any
         merged = dict(current)
         merged.update(out)
 
-        fp = _fingerprint(merged)
-        if last_fp is not None and fp == last_fp:
+        snap = _snapshot_key(merged)
+        if last_snap is not None and snap == last_snap:
             current = merged
             break
 
-        last_fp = fp
+        last_snap = snap
         current = merged
 
-        # Early stop if nothing left to do
-        if not (current.get("want_preprocess") or current.get("want_train") or current.get("want_tune")):
+        # stop if nothing left to do
+        if not (
+            current.get("plan_steps")
+            and not current.get("plan_done")
+        ) and not any(current.get(k) for k in ["want_preprocess", "want_train", "want_tune"]):
             break
 
     # Safety: never drop messages
     if "messages" not in current and "messages" in base:
         current["messages"] = base["messages"]
 
-    # Debug print (optional)
+    # Debug prints
     print("\n=== Supervisor Reason ===")
     print(current.get("supervisor_reason"))
     print("=== Errors ===")

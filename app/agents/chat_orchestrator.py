@@ -116,7 +116,7 @@ class ChatOrchestrator:
         st.setdefault("plan_index", 0)      # current step pointer
         st.setdefault("plan_active", False)
         st.setdefault("plan_done", False)
-        st.setdefault("require_target_col", False)
+        st.setdefault("require_target_col", False)   # planner gate
         st.setdefault("last_plan", None)
 
         st["last_bot"] = None
@@ -343,12 +343,12 @@ class ChatOrchestrator:
     # -------------------- Planner helpers --------------------
     def _looks_like_full_pipeline(self, text: str) -> bool:
         """
-        Detect high-level "do everything end-to-end" requests where the Planner should be used.
+        Detect high-level multi-step requests where the Planner should be used.
         Examples:
           - "Just do everything end to end"
-          - "Clean the data, train the model and tune the best one"
+          - "Clean the data, train the model"
+          - "Do preprocess and training for me"
           - "Please run the full automl pipeline for me"
-          - "From upload to the best tuned model, do the whole thing"
         """
         t = text.lower()
 
@@ -367,15 +367,19 @@ class ChatOrchestrator:
             "whole thing",
             "entire thing",
             "from upload to the best tuned model",
+            "do preprocess and training",
+            "preprocess and train",
+            "clean and train",
         ]
         if any(p in t for p in trigger_phrases):
             return True
 
-        # soft pattern: mentions clean/preprocess + train + tune/optimize
+        # soft pattern: if user mentions at least 2 big steps, planner helps
         has_clean = any(w in t for w in ["clean", "preprocess", "pre-processing"])
         has_train = "train" in t or "training" in t
         has_tune = any(w in t for w in ["tune", "tuning", "optimize", "hyperparameter"])
-        if has_clean and has_train and has_tune:
+
+        if (has_clean and has_train) or (has_clean and has_tune) or (has_train and has_tune):
             return True
 
         # generic "run automl for me" style
@@ -428,6 +432,7 @@ class ChatOrchestrator:
             }
         )
         st["stage"] = "await_plan_target"
+        st["require_target_col"] = True
         return st
 
     def _start_plan(self, user_text: str, st: Dict[str, Any]) -> Dict[str, Any]:
@@ -435,8 +440,8 @@ class ChatOrchestrator:
         Planner entry:
         - Call planner to get tool-order steps
         - Store plan in state
-        - Trigger graph to run step-by-step
-        - If training is in plan and target missing, graph will set require_target_col=True
+        - If training is in plan and target missing, pause and ask user.
+        - Else trigger graph to run step-by-step.
         """
         if st.get("clean_df") is None:
             st["messages"].append(
@@ -491,10 +496,11 @@ class ChatOrchestrator:
         st["tuning_stage"] = None
         st["tuning_offered"] = False
 
-        out = run_automl_graph(st)
+        # If training is part of plan but target missing -> ask and pause BEFORE running graph
+        if "train_baselines" in steps and not st.get("target_col"):
+            return self._ask_target_for_plan(st)
 
-        if out.get("require_target_col"):
-            out = self._ask_target_for_plan(out)
+        out = run_automl_graph(st)
 
         if out.get("plan_done"):
             try:
@@ -530,6 +536,7 @@ class ChatOrchestrator:
                 }
             )
             st["stage"] = "await_plan_target"
+            st["require_target_col"] = True
             return st
 
         st["target_col"] = target
@@ -549,9 +556,6 @@ class ChatOrchestrator:
         )
 
         out = run_automl_graph(st)
-
-        if out.get("require_target_col"):
-            out = self._ask_target_for_plan(out)
 
         if out.get("plan_done"):
             try:
@@ -587,7 +591,7 @@ class ChatOrchestrator:
         if st.get("require_target_col") or stage == "await_plan_target":
             return self._continue_plan_after_target(user_text, st)
 
-        # ✅ Planner trigger for end-to-end requests
+        # ✅ Planner trigger for multi-step / end-to-end requests
         if self._looks_like_full_pipeline(text):
             return self._start_plan(user_text, st)
 
