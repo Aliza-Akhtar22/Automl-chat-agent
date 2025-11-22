@@ -1,129 +1,111 @@
 # app/agents/runner.py
-from typing import Dict, Any
-from copy import deepcopy
+from __future__ import annotations
 
+from typing import Dict, Any, Optional
 from app.agents.graph import build_automl_graph
 
 _app = build_automl_graph()
 
 
-def _invoke_app(base: Dict[str, Any]) -> Dict[str, Any]:
+def _fingerprint(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Create a lightweight, JSON-safe snapshot of state, excluding DataFrames
+    and other un-comparable objects. This is used to detect convergence
+    in the runner loop.
+    """
+    def has_df(x: Any) -> bool:
+        # Avoid importing pandas here; just detect by common attributes
+        return hasattr(x, "shape") and hasattr(x, "columns")
+
+    fp: Dict[str, Any] = {
+        # presence flags (not the objects)
+        "has_clean_df": state.get("clean_df") is not None and has_df(state.get("clean_df")),
+        "has_pre_df": state.get("pre_df") is not None and has_df(state.get("pre_df")),
+        "has_train_result": bool(state.get("train_result")),
+        "has_tuned_result": bool(state.get("tuned_result")),
+
+        # routing flags
+        "want_preprocess": bool(state.get("want_preprocess")),
+        "want_train": bool(state.get("want_train")),
+        "want_tune": bool(state.get("want_tune")),
+
+        # key scalar fields
+        "target_col": state.get("target_col"),
+        "task_type": state.get("task_type"),
+        "chosen_tune_method": state.get("chosen_tune_method"),
+        "tune_metric": state.get("tune_metric"),
+
+        # approval gates
+        "require_approval": bool(state.get("require_approval")),
+        "approved": bool(state.get("approved")),
+    }
+
+    # Optional: include shapes if you want extra safety
+    try:
+        if fp["has_clean_df"]:
+            fp["clean_shape"] = tuple(state["clean_df"].shape)  # type: ignore
+        if fp["has_pre_df"]:
+            fp["pre_shape"] = tuple(state["pre_df"].shape)      # type: ignore
+    except Exception:
+        pass
+
+    return fp
+
+
+def run_automl_graph(state: Dict[str, Any], max_loops: int = 6) -> Dict[str, Any]:
+    """
+    Runs the AutoML graph/safe runner with given state.
+    Re-invokes the graph until the high-level fingerprint stops changing
+    or we hit max_loops. This allows sequential execution (preprocess -> train -> tune)
+    within one user action without comparing DataFrames directly.
+    """
+    base = dict(state)
     cfg = {
         "configurable": {
             "thread_id": base.get("thread_id", "chat-thread"),
             "checkpoint_ns": "automl",
         }
     }
-    try:
-        out = _app.invoke(base, config=cfg)
-    except TypeError:
-        out = _app.invoke(base)
 
-    if not isinstance(out, dict):
-        return base
-    return out
+    last_fp: Optional[Dict[str, Any]] = None
+    current = base
 
+    for _ in range(max_loops):
+        try:
+            out = _app.invoke(current, config=cfg)
+        except TypeError:
+            out = _app.invoke(current)
 
-def run_automl_graph(state: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Runs the AutoML graph/safe runner with given state.
-
-    NEW behavior:
-    - If a planner workflow is active (plan_active=True), we keep invoking
-      the graph to execute steps sequentially in the SAME call, until:
-        * plan_done=True, OR
-        * require_target_col=True (need user input), OR
-        * require_approval=True (HITL gate in non-plan flow), OR
-        * no further progress is made.
-
-    Always merges the graph output back into the original state
-    so chat-specific keys (messages, stage, etc.) are preserved.
-    """
-    base = dict(state)
-
-    # Ensure planner defaults exist (graph also sets these, but runner is defensive)
-    base.setdefault("plan_steps", [])
-    base.setdefault("plan_index", 0)
-    base.setdefault("plan_active", False)
-    base.setdefault("plan_done", False)
-    base.setdefault("require_target_col", False)
-
-    # We will iteratively invoke to "drain" a plan or chained flags.
-    max_iters = 12  # safety cap against infinite loops
-    iters = 0
-
-    last_state_snapshot = None
-    out = base
-
-    while iters < max_iters:
-        iters += 1
-
-        before = deepcopy(out)
-        out_step = _invoke_app(out)
-
-        # Merge step output into out
-        merged_step = dict(out)
-        merged_step.update(out_step)
-
-        # Safety: never drop messages
-        if "messages" not in merged_step and "messages" in out:
-            merged_step["messages"] = out["messages"]
-
-        out = merged_step
-
-        # ----- Stop conditions -----
-        # 1) Planner needs target
-        if out.get("require_target_col"):
+        if not isinstance(out, dict):
             break
 
-        # 2) Non-plan HITL gate (rare in plan flow, but safe)
-        if out.get("require_approval"):
+        merged = dict(current)
+        merged.update(out)
+
+        fp = _fingerprint(merged)
+        if last_fp is not None and fp == last_fp:
+            current = merged
             break
 
-        # 3) Plan finished
-        if out.get("plan_done") or (not out.get("plan_active") and out.get("plan_steps")):
+        last_fp = fp
+        current = merged
+
+        # Early stop if nothing left to do
+        if not (current.get("want_preprocess") or current.get("want_train") or current.get("want_tune")):
             break
 
-        # 4) No explicit wants + no plan active -> nothing else to do
-        if not out.get("plan_active") and not any(
-            out.get(k) for k in ("want_preprocess", "want_train", "want_tune", "want_plan")
-        ):
-            break
+    # Safety: never drop messages
+    if "messages" not in current and "messages" in base:
+        current["messages"] = base["messages"]
 
-        # 5) No progress detected between iterations
-        #    (compare a small snapshot of progress-relevant keys)
-        snapshot_keys = [
-            "pre_df", "train_result", "tuned_result",
-            "plan_active", "plan_index", "plan_done",
-            "want_preprocess", "want_train", "want_tune", "want_plan",
-            "require_target_col", "require_approval",
-            "errors", "history", "supervisor_reason",
-        ]
-        current_snapshot = {k: out.get(k) for k in snapshot_keys}
-
-        if last_state_snapshot is not None and current_snapshot == last_state_snapshot:
-            break
-        last_state_snapshot = current_snapshot
-
-        # 6) If tuned_result already produced, we can stop early
-        if out.get("tuned_result"):
-            break
-
-    # --- Debug prints (kept from your original runner) ---
+    # Debug print (optional)
     print("\n=== Supervisor Reason ===")
-    print(out.get("supervisor_reason"))
+    print(current.get("supervisor_reason"))
     print("=== Errors ===")
-    print(out.get("errors"))
+    print(current.get("errors"))
     print("=== History ===")
-    for h in out.get("history", []):
+    for h in current.get("history", []):
         print(h)
     print("=== END ===\n")
 
-    # Final merge into original base so chat keys persist
-    merged = dict(base)
-    merged.update(out)
-    
-    if "messages" not in merged and "messages" in base:
-        merged["messages"] = base["messages"]
-
-    return merged
+    return current
