@@ -17,6 +17,7 @@ from app.core.utils import best_model_by_task
 from app.agents.llm_utils import chat_once
 from app.agents.prompts import SYSTEM_QA_AGENT  # Q&A prompt
 
+
 # ---------- Page ----------
 st.set_page_config(page_title="Chat AutoML", layout="wide")
 st.title("💬 Chat AutoML")
@@ -36,6 +37,7 @@ if "chat_state" not in st.session_state:
         "messages": [
             {"role": "assistant", "content": "Hi 👋 Upload a CSV to get started."}
         ],
+
         # preprocessing scratch
         "pp_missing_strategy": {},
         "pp_duplicate_strategy": None,
@@ -48,16 +50,19 @@ if "chat_state" not in st.session_state:
         "done_dtypes": False,
         "done_drop_all_nan": False,
         "done_rename": False,
+
         # ---- Training state ----
         "target_col": None,
         "task_type": None,
         "train_result": None,
         "best_model_name": None,
         "best_model_row": None,
+
         # ---- Tuning state ----
         "tuned_result": None,
         "chosen_tune_method": None,
         "tune_metric": None,
+
         # ---- Supervisor / tools state ----
         "want_preprocess": False,
         "want_train": False,
@@ -67,13 +72,22 @@ if "chat_state" not in st.session_state:
         "supervisor_reason": "",
         "history": [],
         "errors": [],
+
         # One-shot flag to suppress preview on simple Q&A
         "suppress_preview_once": False,
+
         # LangGraph / threading hint
         "thread_id": "chat-thread",
+
         # Tuning conversational state
         "tuning_stage": None,
         "tuning_offered": False,
+
+        # ---- NEW: Planner / end-to-end pipeline state ----
+        "last_plan": None,
+        "plan_active": False,           # planner is currently executing steps
+        "require_target_col": False,    # planner asked for target_col
+        "plan_reason": None,            # optional plain-English plan reason
     }
 
 orch = ChatOrchestrator()
@@ -342,11 +356,16 @@ def maybe_answer_qa(user_text: str, state: dict) -> str | None:
     """
     If the user is asking a question about metrics / status / preprocessing / tuning,
     answer it via LLM using SYSTEM_QA_AGENT. Otherwise return None.
+
+    NOTE (planner): if planner is actively running AND waiting for a target,
+    don't route to QA here; let orchestrator handle the target gating.
     """
+    if state.get("plan_active") and state.get("require_target_col"):
+        return None
+
     txt = (user_text or "").strip().lower()
 
-    # 🧭 If the text clearly looks like a *navigation / action* command,
-    # let the orchestrator handle it (preview, train, preprocess, tuning, etc.)
+    # navigation / action commands -> orchestrator
     nav_keywords = [
         "show me the data preview",
         "show me preview",
@@ -372,7 +391,6 @@ def maybe_answer_qa(user_text: str, state: dict) -> str | None:
     if any(k in txt for k in nav_keywords) or txt.strip() in {"preview"}:
         return None
 
-    # NEW: tuning / hyperparameter navigation is always handled by the orchestrator
     tune_nav_keywords = [
         "tune",
         "tuning",
@@ -391,51 +409,18 @@ def maybe_answer_qa(user_text: str, state: dict) -> str | None:
     if any(k in txt for k in tune_nav_keywords):
         return None
 
-    # Heuristic: looks like a question?
+    # looks like a question?
     q_starts = (
-        "what",
-        "which",
-        "how",
-        "why",
-        "did",
-        "have",
-        "has",
-        "is",
-        "are",
-        "was",
-        "were",
-        "can",
-        "could",
-        "show",
-        "give",
-        "tell",
+        "what", "which", "how", "why", "did", "have", "has", "is", "are",
+        "was", "were", "can", "could", "show", "give", "tell",
     )
     looks_like_q = "?" in txt or txt.startswith(q_starts)
 
-    # Mentions project concepts?
     keywords = [
-        "accuracy",
-        "f1",
-        "precision",
-        "recall",
-        "r2",
-        "rmse",
-        "mae",
-        "score",
-        "metric",
-        "leaderboard",
-        "best model",
-        "model name",
-        "tune",
-        "tuning",
-        "hyperparameter",
-        "parameters",
-        "trained",
-        "training",
-        "preprocess",
-        "preprocessing",
-        "done",
-        "finished",
+        "accuracy", "f1", "precision", "recall", "r2", "rmse", "mae",
+        "score", "metric", "leaderboard", "best model", "model name",
+        "parameters", "trained", "training",
+        "preprocess", "preprocessing", "done", "finished",
     ]
     mentions_project = any(k in txt for k in keywords)
 
@@ -473,12 +458,8 @@ def maybe_answer_qa(user_text: str, state: dict) -> str | None:
         "dataset_size": n_rows,
         "leaderboard_top": leaderboard_top,
         "metric_values": metric_values,
-        "cv_score": float(cv_score)
-        if cv_score is not None and pd.notnull(cv_score)
-        else None,
-        "cv_std": float(cv_std)
-        if cv_std is not None and pd.notnull(cv_std)
-        else None,
+        "cv_score": float(cv_score) if cv_score is not None and pd.notnull(cv_score) else None,
+        "cv_std": float(cv_std) if cv_std is not None and pd.notnull(cv_std) else None,
         "tuning_available": bool(tr is not None),
         "tuning_done": bool(tuned is not None),
         "tuned_metrics": tuned_metrics,
@@ -506,7 +487,6 @@ def maybe_answer_qa(user_text: str, state: dict) -> str | None:
         )
         return answer
     except Exception:
-        # Fallback: simple, rule-based answer
         if not snapshot["train_done"]:
             return (
                 "You haven’t trained any models yet, so I don’t have accuracy or other metrics. "
@@ -534,9 +514,14 @@ def ui_train_inline():
     """
     Training UI under preview or standalone if user skips explicit preprocessing.
     Uses Supervisor + tools via run_automl_graph.
+
+    Planner note: if a plan is active, we don't show manual training controls
+    unless the plan is waiting for target (in that case, user can still pick
+    target here or type it in chat).
     """
-    # Hide the entire training block while tuning chat is active
     S2 = st.session_state["chat_state"]
+
+    # Hide training block while tuning chat is active
     if S2.get("tuning_stage") in {"ask_consent", "choose_metric", "choose_method"}:
         return
 
@@ -562,6 +547,10 @@ def ui_train_inline():
 
         if st.button("Train baselines", key="chat_train_btn"):
             with st.spinner("Training baselines... this may take a moment ⏳"):
+                # Manual train turns off any running plan
+                S2["plan_active"] = False
+                S2["require_target_col"] = False
+
                 S2["want_train"] = True
                 S2["approved"] = True
 
@@ -605,7 +594,6 @@ def ui_train_inline():
             task_type = S2.get("task_type", "classification")
             n_rows, n_cols = df_for_train.shape
             f1 = float(row.get("f1", 0) or 0)
-            # Simple quality buckets
             if f1 >= 0.9:
                 quality = "excellent"
             elif f1 >= 0.8:
@@ -700,13 +688,9 @@ def ui_preview_and_download():
         st.session_state["chat_state"] = S2
         return
 
-    # 👉 Show preview ONLY if the user asked for it
+    # Show preview ONLY if the user asked for it
     if not S2.get("show_only_preview", False):
-        # User didn't ask for preview: just show training UI (before training)
-        if S2.get("train_result") is None and not S2.get("want_train", False):
-            ui_train_inline()
-        else:
-            ui_train_inline()
+        ui_train_inline()
         return
 
     # --- Render on-demand preview ---
@@ -735,16 +719,7 @@ def ui_preview_and_download():
         with st.chat_message("assistant"):
             st.markdown(PENDING_ASK_PREPROC["content"])
 
-    # When preview is requested explicitly, we can still show training UI below it (pre-training)
-    if S2.get("train_result") is None and not S2.get("want_train", False):
-        ui_train_inline()
-    else:
-        if S2.get("show_only_preview", False):
-            st.write(
-                "Would you like to **continue preprocessing** or **go to training**?"
-            )
-        else:
-            ui_train_inline()
+    ui_train_inline()
 
 
 # ---------- Upload gate ----------
@@ -835,35 +810,35 @@ else:
         with st.chat_message("assistant"):
             ui_preview_and_download()
 
+
 # ---------- Chat input ----------
 user_text = st.chat_input("Tell me what to do…")
 if user_text:
     # Log user message
     S["messages"].append({"role": "user", "content": user_text})
 
-    # First, try to answer as a Q&A over current state (accuracy, tuning params, status, etc.)
+    # If planner is waiting for target, bypass QA and go straight to orchestrator
+    if S.get("plan_active") and S.get("require_target_col"):
+        st.session_state["chat_state"] = orch.handle(user_text, S)
+
+        # If target now resolved, continue the plan automatically
+        S2 = st.session_state["chat_state"]
+        if S2.get("plan_active") and not S2.get("require_target_col"):
+            S2 = run_automl_graph(S2)
+            st.session_state["chat_state"] = S2
+
+        st.rerun()
+
+    # First, try to answer as Q&A over current state
     qa_answer = maybe_answer_qa(user_text, S)
     if qa_answer is not None:
         S["messages"].append({"role": "assistant", "content": qa_answer})
 
-        # If this was a pure Q&A (no strong action words), suppress preview once
         q = user_text.lower()
         action_words = [
-            "train",
-            "training",
-            "preprocess",
-            "preview",
-            "upload",
-            "clean",
-            "duplicate",
-            "missing",
-            "dtype",
-            "type",
-            "rename",
-            "drop",
-            "nan",
-            "tune",
-            "optimize",
+            "train", "training", "preprocess", "preview", "upload", "clean",
+            "duplicate", "missing", "dtype", "type", "rename", "drop", "nan",
+            "tune", "optimize", "automl", "pipeline", "end to end", "end-to-end",
         ]
         if not any(w in q for w in action_words):
             S["suppress_preview_once"] = True
@@ -871,32 +846,27 @@ if user_text:
         st.session_state["chat_state"] = S
         st.rerun()
 
-    # Otherwise, route to orchestrator for navigation / tuning / preprocessing moves
+    # Otherwise, route to orchestrator for navigation / tuning / preprocessing / planner
     st.session_state["chat_state"] = orch.handle(user_text, S)
-    last_bot = st.session_state["chat_state"].pop("last_bot", None)
+    new_state = st.session_state["chat_state"]
+
+    last_bot = new_state.pop("last_bot", None)
     if last_bot:
-        st.session_state["chat_state"]["messages"].append(
-            {"role": "assistant", "content": last_bot}
-        )
-        # If the user asked a simple Q&A (no action keywords), suppress preview once
-        q = user_text.lower()
-        action_words = [
-            "train",
-            "training",
-            "preprocess",
-            "preview",
-            "upload",
-            "clean",
-            "duplicate",
-            "missing",
-            "dtype",
-            "type",
-            "rename",
-            "drop",
-            "nan",
-            "tune",
-            "optimize",
-        ]
-        if not any(w in q for w in action_words):
-            st.session_state["chat_state"]["suppress_preview_once"] = True
+        new_state["messages"].append({"role": "assistant", "content": last_bot})
+
+    # If planner is active and not waiting for target, keep executing automatically
+    if new_state.get("plan_active") and not new_state.get("require_target_col"):
+        new_state = run_automl_graph(new_state)
+        st.session_state["chat_state"] = new_state
+
+    # Suppress preview once for pure Q&A feeling messages
+    q = user_text.lower()
+    action_words = [
+        "train", "training", "preprocess", "preview", "upload", "clean",
+        "duplicate", "missing", "dtype", "type", "rename", "drop", "nan",
+        "tune", "optimize", "automl", "pipeline", "end to end", "end-to-end",
+    ]
+    if not any(w in q for w in action_words):
+        st.session_state["chat_state"]["suppress_preview_once"] = True
+
     st.rerun()
