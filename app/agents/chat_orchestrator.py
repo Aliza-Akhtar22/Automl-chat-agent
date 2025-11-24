@@ -9,10 +9,8 @@ import numpy as np
 from app.agents.llm_utils import chat_once
 from app.agents.prompts import SYSTEM_DATA_SUMMARY, SYSTEM_QA_AGENT
 from app.core.preprocessing import coerce_nulls, missing_report, dtypes_dict
-from app.core.utils import best_model_by_task  # ✅ added detect_task_type
-from app.agents.nodes import choose_task_type
+from app.core.utils import best_model_by_task
 from app.agents.runner import run_automl_graph
-from app.agents.planner_agent import make_plan  # ✅ NEW: planner
 
 
 # --------------- Conversation Stages ---------------
@@ -25,7 +23,6 @@ from app.agents.planner_agent import make_plan  # ✅ NEW: planner
 # prep_drop_all_nan   -> multiselect all-NaN columns (apply)
 # prep_rename         -> rename columns (add more / done)
 # preview_download    -> show preprocessed/clean preview + download
-# await_plan_target   -> planner running; waiting for user target col
 # tuning:
 #   tuning_stage:
 #       None / "ask_consent" / "choose_method" / "choose_metric"
@@ -72,8 +69,7 @@ class ChatOrchestrator:
                 "role": "assistant",
                 "content": (
                     f"{para}\n\n"
-                    "Would you like to proceed with **preprocessing** now? (yes / no)\n"
-                    "_You can also say “do everything end-to-end” if you want the full pipeline._"
+                    "Would you like to proceed with **preprocessing** now? (yes / no)"
                 ),
             }
         )
@@ -110,14 +106,6 @@ class ChatOrchestrator:
         st["require_approval"] = False
         st["approved"] = False
         st["supervisor_reason"] = ""
-
-        # ✅ Planner-related runtime state for graph-driven plan execution
-        st.setdefault("plan_steps", [])     # list of tool names in order
-        st.setdefault("plan_index", 0)      # current step pointer
-        st.setdefault("plan_active", False)
-        st.setdefault("plan_done", False)
-        st.setdefault("require_target_col", False)   # planner gate
-        st.setdefault("last_plan", None)
 
         st["last_bot"] = None
         return st
@@ -227,6 +215,7 @@ class ChatOrchestrator:
             return "rmse"
         if "mae" in t:
             return "mae"
+        # Shortcuts like "maximize f1" or "optimize r2" are handled above already.
         # Provide safe defaults by task if user only says "yes".
         return "f1" if task_type == "classification" else "r2"
 
@@ -292,8 +281,6 @@ class ChatOrchestrator:
                 "drop_all_nan": st.get("done_drop_all_nan"),
                 "rename": st.get("done_rename"),
             },
-            "plan_active": st.get("plan_active"),
-            "plan_done": st.get("plan_done"),
         }
         return snapshot
 
@@ -340,245 +327,16 @@ class ChatOrchestrator:
         ]
         return any(k in t for k in keywords)
 
-    # -------------------- Planner helpers --------------------
-    def _looks_like_full_pipeline(self, text: str) -> bool:
-        """
-        Detect high-level multi-step requests where the Planner should be used.
-        Examples:
-          - "Just do everything end to end"
-          - "Clean the data, train the model"
-          - "Do preprocess and training for me"
-          - "Please run the full automl pipeline for me"
-        """
-        t = text.lower()
-
-        trigger_phrases = [
-            "end to end",
-            "end-to-end",
-            "full pipeline",
-            "full automl",
-            "full auto ml",
-            "do everything",
-            "do the whole thing",
-            "do the whole pipeline",
-            "run everything",
-            "run the whole",
-            "run the entire",
-            "whole thing",
-            "entire thing",
-            "from upload to the best tuned model",
-            "do preprocess and training",
-            "preprocess and train",
-            "clean and train",
-        ]
-        if any(p in t for p in trigger_phrases):
-            return True
-
-        # soft pattern: if user mentions at least 2 big steps, planner helps
-        has_clean = any(w in t for w in ["clean", "preprocess", "pre-processing"])
-        has_train = "train" in t or "training" in t
-        has_tune = any(w in t for w in ["tune", "tuning", "optimize", "hyperparameter"])
-
-        if (has_clean and has_train) or (has_clean and has_tune) or (has_train and has_tune):
-            return True
-
-        # generic "run automl for me" style
-        if "automl" in t and any(w in t for w in ["run", "do", "everything", "pipeline"]):
-            return True
-
-        return False
-
-    def _resolve_target_from_text(self, st: Dict[str, Any], user_text: str) -> Optional[str]:
-        """
-        Simple resolver for planner target gating:
-        - exact match
-        - case-insensitive
-        - underscore/space-insensitive
-        """
-        df_for_cols = st.get("pre_df") or st.get("clean_df")
-        if not isinstance(df_for_cols, pd.DataFrame):
-            return None
-
-        cols = df_for_cols.columns.tolist()
-        raw = (user_text or "").strip()
-
-        for c in cols:
-            if raw == c or raw.lower() == str(c).lower():
-                return c
-
-        def norm(x: str) -> str:
-            return "".join(ch for ch in x.lower() if ch.isalnum())
-
-        nraw = norm(raw)
-        for c in cols:
-            if norm(str(c)) == nraw:
-                return c
-
-        return None
-
-    def _ask_target_for_plan(self, st: Dict[str, Any]) -> Dict[str, Any]:
-        df_for_cols = st.get("pre_df") or st.get("clean_df")
-        cols = df_for_cols.columns.tolist() if isinstance(df_for_cols, pd.DataFrame) else []
-
-        st["messages"].append(
-            {
-                "role": "assistant",
-                "content": (
-                    "To continue the **end-to-end run**, I need one thing:\n\n"
-                    "**Which column should we predict?** (your target column)\n"
-                    + (f"Columns: {cols}\n\n" if cols else "\n")
-                    + "Please type the exact column name."
-                ),
-            }
-        )
-        st["stage"] = "await_plan_target"
-        st["require_target_col"] = True
-        return st
-
-    def _start_plan(self, user_text: str, st: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Planner entry:
-        - Call planner to get tool-order steps
-        - Store plan in state
-        - If training is in plan and target missing, pause and ask user.
-        - Else trigger graph to run step-by-step.
-        """
-        if st.get("clean_df") is None:
-            st["messages"].append(
-                {
-                    "role": "assistant",
-                    "content": (
-                        "I can run the full **end-to-end AutoML pipeline**, "
-                        "but first I need a dataset. Please upload a CSV."
-                    ),
-                }
-            )
-            return st
-
-        try:
-            plan = make_plan(user_text)  # {"steps":[...], "reason":"..."}
-        except Exception:
-            plan = {"steps": ["preprocess_data", "train_baselines", "tune_best_model_optuna"], "reason": ""}
-
-        steps = plan.get("steps") or []
-        st["last_plan"] = plan
-
-        pretty = []
-        for i, sname in enumerate(steps, 1):
-            if sname == "preprocess_data":
-                pretty.append(f"{i}. Preprocess / clean the data")
-            elif sname == "train_baselines":
-                pretty.append(f"{i}. Train baseline models")
-            elif "tune_best_model" in sname:
-                pretty.append(f"{i}. Tune the best model")
-            else:
-                pretty.append(f"{i}. {sname}")
-
-        st["messages"].append(
-            {
-                "role": "assistant",
-                "content": (
-                    "Got it — I’ll run this as a **full AutoML workflow**.\n\n"
-                    f"**Plan:**\n" + ("\n".join(pretty) if pretty else "1. (No valid steps detected)") +
-                    "\n\nI’ll start now and pause only if I need your target column."
-                ),
-            }
-        )
-
-        # Save plan for the graph to execute
-        st["plan_steps"] = steps
-        st["plan_index"] = 0
-        st["plan_active"] = True
-        st["plan_done"] = False
-        st["require_target_col"] = False
-
-        # Clear manual tuning chat so planner owns the flow
-        st["tuning_stage"] = None
-        st["tuning_offered"] = False
-
-        # If training is part of plan but target missing -> ask and pause BEFORE running graph
-        if "train_baselines" in steps and not st.get("target_col"):
-            return self._ask_target_for_plan(st)
-
-        out = run_automl_graph(st)
-
-        if out.get("plan_done"):
-            try:
-                summary_q = (
-                    "Please summarize, in friendly plain English, what preprocessing, training, "
-                    "and tuning (if any) were done, and highlight the best model and key metrics."
-                )
-                summary = self._qa_answer(summary_q, out)
-            except Exception:
-                summary = "End-to-end run finished. Please review the results panel."
-            out["messages"].append(
-                {"role": "assistant", "content": f"🧾 **End-to-end run summary**\n\n{summary}"}
-            )
-
-        return out
-
-    def _continue_plan_after_target(self, user_text: str, st: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Called when planner paused for target column.
-        """
-        target = self._resolve_target_from_text(st, user_text)
-        if not target:
-            df_for_cols = st.get("pre_df") or st.get("clean_df")
-            cols = df_for_cols.columns.tolist() if isinstance(df_for_cols, pd.DataFrame) else []
-            st["messages"].append(
-                {
-                    "role": "assistant",
-                    "content": (
-                        "I couldn’t match that to a column. "
-                        "Please type the exact target column name.\n\n"
-                        + (f"Columns: {cols}" if cols else "")
-                    ),
-                }
-            )
-            st["stage"] = "await_plan_target"
-            st["require_target_col"] = True
-            return st
-
-        st["target_col"] = target
-
-        # Detect task type early so training runs smoothly
-        df_for_train = st.get("pre_df") or st.get("clean_df")
-        if isinstance(df_for_train, pd.DataFrame):
-            try:
-                st["task_type"] = st.get("task_type") or choose_task_type(df_for_train[target])
-            except Exception:
-                st.setdefault("task_type", "classification")
-
-        st["require_target_col"] = False
-        st["stage"] = "preview_download"
-        st["messages"].append(
-            {"role": "assistant", "content": f"Perfect — using **{target}** as the target. Continuing the plan…"}
-        )
-
-        out = run_automl_graph(st)
-
-        if out.get("plan_done"):
-            try:
-                summary_q = (
-                    "Please summarize, in friendly plain English, what preprocessing, training, "
-                    "and tuning (if any) were done, and highlight the best model and key metrics."
-                )
-                summary = self._qa_answer(summary_q, out)
-            except Exception:
-                summary = "End-to-end run finished. Please review the results panel."
-            out["messages"].append(
-                {"role": "assistant", "content": f"🧾 **End-to-end run summary**\n\n{summary}"}
-            )
-
-        return out
-
     # -------------------- Router for user free text --------------------
     def handle(self, user_text: str, state: Dict[str, Any]) -> Dict[str, Any]:
         """
         Conversation brain:
         - Decodes user intent.
-        - Existing wizard + tuning flow remains.
-        - NEW: planner for end-to-end requests, graph executes plan step-by-step.
+        - Sets high-level flags / stage.
+        - Triggers graph for **tuning** once the metric is known (defaults set).
+        - Preprocess execution is triggered separately by UI preview (run_preprocess_now).
+        - If the message looks like a *question*, route to the QA helper instead of
+          just saying "use the controls above".
         """
         st = state.copy()
         st["last_bot"] = None
@@ -586,14 +344,6 @@ class ChatOrchestrator:
         stage = st.get("stage", "await_upload")
         tuning_stage = st.get("tuning_stage")
         text = (user_text or "").strip().lower()
-
-        # ✅ If planner is waiting for target, treat this as target input
-        if st.get("require_target_col") or stage == "await_plan_target":
-            return self._continue_plan_after_target(user_text, st)
-
-        # ✅ Planner trigger for multi-step / end-to-end requests
-        if self._looks_like_full_pipeline(text):
-            return self._start_plan(user_text, st)
 
         def wants_preview(t: str) -> bool:
             preview_words = ["preview", "show preview", "see preview", "download", "show data", "see data", "show table"]
@@ -621,7 +371,9 @@ class ChatOrchestrator:
             return any(w in t for w in ["tune", "tuning", "optimize", "improve model", "hyperparameter"])
 
         # -------- GLOBAL handling of direct "tune" requests --------
+        # User can say "tune the model" / "go to tuning part" at ANY time.
         if wants_tune(text) and tuning_stage is None:
+            # 1) If training has NOT been done yet -> explain that training is required first.
             if not st.get("train_result"):
                 st["messages"].append(
                     {
@@ -636,9 +388,11 @@ class ChatOrchestrator:
                 )
                 return st
 
+            # 2) Training is done -> jump directly into the tuning conversation
             task = st.get("task_type", "classification")
             suggested = "f1" if task == "classification" else "r2"
 
+            # Recommend a method + short explanation
             method, reason = self._recommend_tuning(st)
             methods_brief = self._tuning_methods_brief()
             st["chosen_tune_method"] = method
@@ -664,6 +418,7 @@ class ChatOrchestrator:
 
         # -------------------- TUNING: consent → metric → auto-run --------------------
         if tuning_stage == "ask_consent":
+            # Allow user to jump back to preprocess even while tuning question is visible
             if "preprocess" in text or "pre-processing" in text:
                 st["tuning_stage"] = None
                 st["messages"].append(
@@ -680,6 +435,7 @@ class ChatOrchestrator:
                 st["show_only_preview"] = False
                 return st
 
+            # If the user asks for metrics/leaderboard instead of yes/no → QA
             if self._looks_like_qa(text):
                 answer = self._qa_answer(user_text, st)
                 st["messages"].append({"role": "assistant", "content": answer})
@@ -697,10 +453,11 @@ class ChatOrchestrator:
                 return st
 
             if text in yes_words or wants_tune(text):
+                # Ask ONLY for the metric now
                 task = st.get("task_type", "classification")
                 suggested = "f1" if task == "classification" else "r2"
                 st["tuning_stage"] = "choose_metric"
-
+                # Brief explanation & recommendation between methods
                 method, reason = self._recommend_tuning(st)
                 methods_brief = self._tuning_methods_brief()
                 st["chosen_tune_method"] = method
@@ -722,12 +479,14 @@ class ChatOrchestrator:
                 )
                 return st
 
+            # clarification
             st["messages"].append(
                 {"role": "assistant", "content": "Please reply with **yes** to tune the model, or **no** to keep the baseline."}
             )
             return st
 
         if tuning_stage == "choose_metric":
+            # Optional switch to random search if user mentions it here
             if "random" in text:
                 st["chosen_tune_method"] = "random_search"
             elif "bayes" in text or "bayesian" in text:
@@ -737,13 +496,16 @@ class ChatOrchestrator:
             metric = self._parse_metric(text, task)
             if metric:
                 st["tune_metric"] = metric
+                # Defaults: method = bayesian if not explicitly changed
                 st["chosen_tune_method"] = st.get("chosen_tune_method") or "bayesian"
 
+                # Trigger tuning immediately via graph (pure SSA-style)
                 st["want_tune"] = True
-                st["approved"] = True
+                st["approved"] = True  # pass HITL gate automatically after chat consent
                 out = run_automl_graph(st)
 
                 if out.get("tuned_result"):
+                    # Success message + tiny summary
                     tr = out["tuned_result"]
                     best_params = tr.get("best_params", {})
                     test_metrics = tr.get("test_metrics", {})
@@ -773,6 +535,7 @@ class ChatOrchestrator:
                 out["tuning_stage"] = None
                 return out
 
+            # If user didn’t provide a recognizable metric, re-ask with examples
             st["messages"].append(
                 {
                     "role": "assistant",
@@ -969,6 +732,7 @@ class ChatOrchestrator:
         if self._looks_like_qa(text):
             answer = self._qa_answer(user_text, st)
             st["messages"].append({"role": "assistant", "content": answer})
+            # Let the UI know not to auto-show preview in response to pure Q&A
             st["suppress_preview_once"] = True
             return st
 
@@ -1180,3 +944,4 @@ class ChatOrchestrator:
 
         out = run_automl_graph(st)
         return out
+    

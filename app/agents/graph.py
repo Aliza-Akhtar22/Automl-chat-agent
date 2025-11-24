@@ -1,7 +1,24 @@
 # app/agents/graph.py
+# LangGraph orchestration for the AutoML Agent with an LLM Supervisor + tool calls.
+# The Supervisor decides which tool to run next based on the state.
+# If LangGraph is not available, falls back to a simple runner.
+#
+# Designed to be used by:
+# - chat_app.py
+# - chat_orchestrator.py
+#
+# Pattern:
+# - Chat / UI sets intent flags: want_preprocess, want_train, want_tune (+ target_col, etc.)
+# - We call run_automl_graph(state) → invokes this graph.
+# - Supervisor:
+#       * For explicit want_preprocess: directly runs preprocess_data tool.
+#       * For training/tuning: enforces optional HITL via approved/require_approval.
+#       * Otherwise: uses an LLM to pick ONE tool from the registry.
+# - Tools (in app/agents/tools.py) wrap your existing core logic.
+
 from typing import TypedDict, Optional, Literal, Dict, Any, List
 
-from app.agents import nodes
+from app.agents import nodes  # used by fallback app
 from app.agents.tools import (
     preprocess_data_tool,
     choose_task_type_tool,
@@ -12,6 +29,9 @@ from app.agents.tools import (
 from app.agents.llm_utils import chat_json
 
 
+# ==============================
+# Shared State Schema
+# ==============================
 class AutoMLState(TypedDict, total=False):
     # Data artifacts
     raw_df: Any
@@ -40,18 +60,14 @@ class AutoMLState(TypedDict, total=False):
     best_model_row: Dict[str, Any]
     tuned_result: Dict[str, Any]
 
-    # Routing flags
+    # Routing flags (set by UI / chat)
     want_preprocess: bool
     want_train: bool
     want_tune: bool
 
+    # Tuning options (lightweight)
     chosen_tune_method: Optional[Literal["bayesian", "random_search"]]
-    tune_metric: Optional[str]
-
-    # NEW: plan execution
-    plan_steps: List[str]          # ordered tool names
-    plan_index: int               # next step index
-    plan_done: bool
+    tune_metric: Optional[str]  # e.g. "f1", "accuracy", "r2", "rmse", "mae"
 
     # Supervisor / HITL
     require_approval: bool
@@ -61,10 +77,14 @@ class AutoMLState(TypedDict, total=False):
     errors: List[str]
 
 
+# ==============================
+# LangGraph App (preferred)
+# ==============================
 def _build_langgraph_app():
     from langgraph.graph import StateGraph, END
     import json
 
+    # Tool registry: names the LLM can pick → actual LangChain tools
     TOOL_REGISTRY = {
         "preprocess_data": preprocess_data_tool,
         "choose_task_type": choose_task_type_tool,
@@ -78,11 +98,9 @@ def _build_langgraph_app():
         s.setdefault("errors", [])
         s.setdefault("require_approval", False)
         s.setdefault("approved", False)
-        s.setdefault("plan_steps", [])
-        s.setdefault("plan_index", 0)
-        s.setdefault("plan_done", False)
 
     def _invoke(tool_name: str, s: Dict[str, Any]) -> Dict[str, Any]:
+        """Invoke a LangChain tool with the correct signature and add audit trail."""
         tool = TOOL_REGISTRY.get(tool_name)
         if tool is None:
             s["errors"].append(f"{tool_name} tool not found in registry.")
@@ -98,69 +116,40 @@ def _build_langgraph_app():
         return new_state
 
     def node_supervisor(state: AutoMLState) -> AutoMLState:
+        """
+        LLM-driven Supervisor with deterministic paths for explicit actions.
+        """
         s: Dict[str, Any] = dict(state)
         _ensure_defaults(s)
 
         # -----------------------------
-        # A) Deterministic PLAN mode
-        # -----------------------------
-        steps: List[str] = s.get("plan_steps") or []
-        idx: int = int(s.get("plan_index") or 0)
-        if steps and idx < len(steps) and not s.get("plan_done"):
-            next_tool = steps[idx]
-
-            # Train/tune approval gates still apply, but planner/orchestrator
-            # can set approved=True automatically.
-            if next_tool == "train_baselines" and not s.get("train_result"):
-                if not s.get("approved", False):
-                    s["require_approval"] = True
-                    s["supervisor_reason"] = "About to train baseline models. Please approve."
-                    s["history"].append({"step": "supervisor", "action": "await_train_approval"})
-                    return s
-
-            if next_tool.startswith("tune_best_model") and s.get("train_result") and not s.get("tuned_result"):
-                if not s.get("approved", False):
-                    s["require_approval"] = True
-                    s["supervisor_reason"] = "About to run hyperparameter tuning. Please approve."
-                    s["history"].append({"step": "supervisor", "action": "await_tune_approval"})
-                    return s
-
-            try:
-                new_state = _invoke(next_tool, s)
-                new_state["plan_index"] = idx + 1
-                new_state["approved"] = False
-                new_state["require_approval"] = False
-                if new_state["plan_index"] >= len(steps):
-                    new_state["plan_done"] = True
-                return new_state  # type: ignore
-            except Exception as e:
-                s["errors"].append(f"plan_step_error({next_tool}): {e}")
-                s["supervisor_reason"] = f"Error while running planned step '{next_tool}'."
-                return s
-
-        # -----------------------------
-        # B) Explicit preprocess trigger
+        # 0) Explicit preprocess trigger
         # -----------------------------
         if s.get("want_preprocess") and s.get("clean_df") is not None and s.get("pre_df") is None:
             try:
                 new_state = _invoke("preprocess_data", s)
                 new_state["want_preprocess"] = False
-                return new_state  # type: ignore
+                return new_state  # type: ignore[return-value]
             except Exception as e:
                 s["errors"].append(f"preprocess_direct_error: {e}")
                 s["supervisor_reason"] = "Error while running preprocess_data."
+                s["history"].append({"step": "supervisor", "action": "tool_error", "tool": "preprocess_data"})
                 return s
 
         # -----------------------------
-        # C) HITL for train / tune (non-plan mode)
+        # 1) HITL: approvals for train / tune
         # -----------------------------
+        # Training approval gate
         if s.get("want_train") and not s.get("train_result"):
             if not s.get("approved", False):
                 s["require_approval"] = True
-                s["supervisor_reason"] = "About to train baseline models. Please approve."
+                s["supervisor_reason"] = (
+                    "About to train baseline models on (pre)processed data. Please approve."
+                )
                 s["history"].append({"step": "supervisor", "action": "await_train_approval"})
                 return s
 
+        # Deterministic TRAIN execution after approval
         if s.get("want_train") and s.get("approved", False) and not s.get("train_result"):
             try:
                 new_state = _invoke("train_baselines", s)
@@ -173,6 +162,7 @@ def _build_langgraph_app():
                 s["supervisor_reason"] = "Error while running train_baselines directly."
                 return s
 
+        # Tuning approval gate
         if s.get("want_tune") and s.get("train_result") and not s.get("tuned_result"):
             if not s.get("approved", False):
                 s["require_approval"] = True
@@ -180,7 +170,9 @@ def _build_langgraph_app():
                 s["history"].append({"step": "supervisor", "action": "await_tune_approval"})
                 return s
 
+        # Deterministic TUNE execution after approval
         if s.get("want_tune") and s.get("approved", False) and s.get("train_result") and not s.get("tuned_result"):
+            # Pick tool by chosen_tune_method; default to Optuna/Bayesian
             method = (s.get("chosen_tune_method") or "bayesian").lower()
             tool_name = "tune_best_model_optuna" if method == "bayesian" else "tune_best_model_random_search"
             try:
@@ -194,11 +186,12 @@ def _build_langgraph_app():
                 s["supervisor_reason"] = f"Error while running {tool_name} directly."
                 return s
 
+        # Reset approval flags if nothing waiting
         s["require_approval"] = False
         s["approved"] = False
 
         # -----------------------------
-        # D) If no data, idle
+        # 2) If no data, nothing to do
         # -----------------------------
         if s.get("clean_df") is None and s.get("pre_df") is None:
             s["supervisor_reason"] = "Waiting for dataset upload / basic cleaning."
@@ -206,7 +199,7 @@ def _build_langgraph_app():
             return s
 
         # -----------------------------
-        # E) LLM auto-pilot chooser
+        # 3) LLM decision summary (fallback/auto-pilot)
         # -----------------------------
         summary = {
             "has_clean_df": s.get("clean_df") is not None,
@@ -237,8 +230,12 @@ def _build_langgraph_app():
         except Exception as e:
             s["errors"].append(f"supervisor_llm_error: {e}")
             s["supervisor_reason"] = "LLM decision failed; no automatic action taken."
+            s["history"].append({"step": "supervisor", "action": "llm_error"})
             return s
 
+        # -----------------------------
+        # 4) Run selected tool (if any)
+        # -----------------------------
         if not tool_name:
             s["supervisor_reason"] = "No further automatic step selected."
             s["history"].append({"step": "supervisor", "action": "no_tool"})
@@ -246,12 +243,16 @@ def _build_langgraph_app():
 
         try:
             new_state = _invoke(tool_name, s)
-            return new_state  # type: ignore
+            return new_state  # type: ignore[return-value]
         except Exception as e:
             s["errors"].append(f"supervisor_tool_error({tool_name}): {e}")
             s["supervisor_reason"] = f"Error while running tool '{tool_name}'."
+            s["history"].append({"step": "supervisor", "action": "tool_error", "tool": tool_name})
             return s
 
+    # -----------------------------
+    # Graph setup
+    # -----------------------------
     g = StateGraph(AutoMLState)
     g.add_node("supervisor", node_supervisor)
     g.set_entry_point("supervisor")
@@ -259,29 +260,14 @@ def _build_langgraph_app():
     return g.compile()
 
 
+# ==============================
+# Fallback runner
+# ==============================
 class _SimpleApp:
     def invoke(self, state: Dict[str, Any], config: Dict[str, Any] = None, **kwargs) -> Dict[str, Any]:
         s = dict(state)
         s.setdefault("history", [])
         s.setdefault("errors", [])
-        s.setdefault("plan_steps", [])
-        s.setdefault("plan_index", 0)
-        s.setdefault("plan_done", False)
-
-        # PLAN mode (fallback): run 1 step per invoke
-        steps = s.get("plan_steps") or []
-        idx = int(s.get("plan_index") or 0)
-        if steps and idx < len(steps) and not s.get("plan_done"):
-            step = steps[idx]
-            # map planned step to existing flags
-            if step == "preprocess_data":
-                s["want_preprocess"] = True
-            elif step == "train_baselines":
-                s["want_train"] = True
-                s["approved"] = True
-            elif step.startswith("tune_best_model"):
-                s["want_tune"] = True
-                s["approved"] = True
 
         # Preprocess
         if s.get("want_preprocess") and "clean_df" in s and s.get("pre_df") is None:
@@ -305,17 +291,23 @@ class _SimpleApp:
             except Exception as e:
                 s["errors"].append(f"preprocess_error: {e}")
 
-        # Task type
+        # Task type if possible
         df_for_task = s.get("pre_df") if s.get("pre_df") is not None else s.get("clean_df")
-        if df_for_task is not None and s.get("target_col") and not s.get("task_type"):
-            try:
-                y = df_for_task[s["target_col"]]
-                s["task_type"] = nodes.choose_task_type(y)
-            except Exception as e:
-                s["errors"].append(f"task_type_error: {e}")
+        if df_for_task is not None and s.get("target_col"):
+            if not s.get("task_type"):
+                try:
+                    y = df_for_task[s["target_col"]]
+                    s["task_type"] = nodes.choose_task_type(y)
+                except Exception as e:
+                    s["errors"].append(f"task_type_error: {e}")
 
         # Train
-        if s.get("want_train") and df_for_task is not None and s.get("target_col") and not s.get("train_result"):
+        if (
+            s.get("want_train")
+            and df_for_task is not None
+            and s.get("target_col")
+            and not s.get("train_result")
+        ):
             try:
                 y = df_for_task[s["target_col"]]
                 X = df_for_task.drop(columns=[s["target_col"]])
@@ -328,18 +320,17 @@ class _SimpleApp:
             except Exception as e:
                 s["errors"].append(f"train_error: {e}")
 
-        # advance plan index if a planned flag just finished
-        if steps and not s.get("want_preprocess") and not s.get("want_train") and not s.get("want_tune"):
-            if idx < len(steps):
-                s["plan_index"] = idx + 1
-                if s["plan_index"] >= len(steps):
-                    s["plan_done"] = True
-
+        # (Fallback keeps tuning under LangGraph tools in the preferred path.)
         return s
 
 
+# ==============================
+# Public factory
+# ==============================
 def build_automl_graph():
     try:
         return _build_langgraph_app()
     except Exception:
         return _SimpleApp()
+    
+    
