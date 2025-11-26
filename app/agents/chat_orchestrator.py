@@ -17,23 +17,8 @@ from app.core.utils import best_model_by_task
 from app.agents.runner import run_automl_graph
 
 
-# --------------- Conversation Stages ---------------
-# await_upload        -> ask user to upload
-# ask_preprocess      -> show data summary + ask yes/no to proceed
-# prep_menu           -> suggest next steps & render per-method widgets
-# prep_missing        -> missing values per-column (add more / done)
-# prep_duplicates     -> duplicate rows strategy (single choice) (done)
-# prep_dtypes         -> enforce dtypes (add more / done)
-# prep_drop_all_nan   -> multiselect all-NaN columns (apply)
-# prep_rename         -> rename columns (add more / done)
-# preview_download    -> show preprocessed/clean preview + download
-# tuning:
-#   tuning_stage:
-#       None / "ask_consent" / "choose_method" / "choose_metric"
-#   chosen_tune_method:
-#       None / "bayesian" / "random_search"
-#   tune_metric:
-#       None / "f1" / "accuracy" / "precision" / "recall" / "r2" / "rmse" / "mae"
+
+
 
 
 class ChatOrchestrator:
@@ -426,37 +411,51 @@ class ChatOrchestrator:
         Conversation brain:
         - Decodes user intent.
         - Sets high-level flags / stage.
-        - Triggers graph for **tuning** once the metric is known (defaults set).
-        - Preprocess execution is triggered separately by UI preview (run_preprocess_now).
-        - If the message looks like a *question*, route to the QA helper instead of
-          just saying "use the controls above".
+        - Tuning is handled via the graph once the metric is known.
+        - Preprocessing for non-technical users is automatic:
+            * Saying "yes" at the preprocess question runs an internal plan
+              (duplicates drop, all-NaN dropped, missing handled) and then
+              shows a preprocessed preview.
+        - If the message looks like a *question*, route to the QA helper instead
+          of just saying "use the controls above".
         """
         st = state.copy()
         st["last_bot"] = None
 
         stage = st.get("stage", "await_upload")
         tuning_stage = st.get("tuning_stage")
-        text = (user_text or "").strip().lower()
+        text_raw = (user_text or "").strip()
+        text = text_raw.lower()
 
         def wants_preview(t: str) -> bool:
-            preview_words = ["preview", "show preview", "see preview", "download", "show data", "see data", "show table"]
+            preview_words = [
+                "preview", "show preview", "see preview", "download",
+                "show data", "see data", "show table"
+            ]
             return any(w in t for w in preview_words)
 
         def wants_continue(t: str) -> bool:
-            continue_words = ["continue", "next", "keep going", "proceed", "go on", "carry on", "continue preprocessing"]
+            continue_words = [
+                "continue", "next", "keep going", "proceed",
+                "go on", "carry on"
+            ]
             return any(w in t for w in continue_words)
 
         def wants_train(t: str) -> bool:
             strong_phrases = [
-                "go to training", "go to the training", "go to the training part", "training part",
-                "model training", "start training", "start the training", "run training", "run the training",
-                "train baselines", "train the model", "move to training", "move forward with training",
-                "move forward with the model training", "proceed to training", "proceed to the training",
+                "go to training", "go to the training", "go to the training part",
+                "training part", "model training", "start training",
+                "start the training", "run training", "run the training",
+                "train baselines", "train the model", "move to training",
+                "move forward with training", "move forward with the model training",
+                "proceed to training", "proceed to the training",
                 "proceed to train", "go for training",
             ]
             if any(p in t for p in strong_phrases):
                 return True
-            if ("train" in t or "training" in t) and any(v in t for v in ["go", "start", "run", "move", "proceed", "forward", "jump"]):
+            if ("train" in t or "training" in t) and any(
+                v in t for v in ["go", "start", "run", "move", "proceed", "forward", "jump"]
+            ):
                 return True
             return t in {"train", "training"}
 
@@ -519,13 +518,13 @@ class ChatOrchestrator:
                         "role": "assistant",
                         "content": (
                             "Sure 👍 we can go back to **preprocessing**.\n"
-                            "Use the preprocessing controls above to adjust your data, then "
-                            "you can retrain the baselines when you’re ready."
+                            "I’ll keep handling the cleaning automatically in the background; "
+                            "you can still retrain the baselines when you’re ready."
                         ),
                     }
                 )
-                st["stage"] = "prep_menu"
-                st["show_only_preview"] = False
+                st["stage"] = "preview_download"
+                st["show_only_preview"] = True
                 return st
 
             # If the user asks for metrics/leaderboard instead of yes/no → QA
@@ -541,7 +540,10 @@ class ChatOrchestrator:
             if text in no_words:
                 st["tuning_stage"] = None
                 st["messages"].append(
-                    {"role": "assistant", "content": "No worries 👍 We’ll keep the current baseline model. Say **tune the model** anytime."}
+                    {
+                        "role": "assistant",
+                        "content": "No worries 👍 We’ll keep the current baseline model. Say **tune the model** anytime.",
+                    }
                 )
                 return st
 
@@ -574,7 +576,10 @@ class ChatOrchestrator:
 
             # clarification
             st["messages"].append(
-                {"role": "assistant", "content": "Please reply with **yes** to tune the model, or **no** to keep the baseline."}
+                {
+                    "role": "assistant",
+                    "content": "Please reply with **yes** to tune the model, or **no** to keep the baseline.",
+                }
             )
             return st
 
@@ -592,7 +597,7 @@ class ChatOrchestrator:
                 # Defaults: method = bayesian if not explicitly changed
                 st["chosen_tune_method"] = st.get("chosen_tune_method") or "bayesian"
 
-                # Trigger tuning immediately via graph (pure SSA-style)
+                # Trigger tuning immediately via graph
                 st["want_tune"] = True
                 st["approved"] = True  # pass HITL gate automatically after chat consent
                 out = run_automl_graph(st)
@@ -602,7 +607,9 @@ class ChatOrchestrator:
                     tr = out["tuned_result"]
                     best_params = tr.get("best_params", {})
                     test_metrics = tr.get("test_metrics", {})
-                    method_label = "Bayesian optimization" if out.get("chosen_tune_method") == "bayesian" else "Random search"
+                    method_label = (
+                        "Bayesian optimization" if out.get("chosen_tune_method") == "bayesian" else "Random search"
+                    )
                     out["messages"].append(
                         {
                             "role": "assistant",
@@ -669,12 +676,16 @@ class ChatOrchestrator:
             if wants_tune(text):
                 brief = self._tuning_methods_brief()
                 st["messages"].append(
-                    {"role": "assistant", "content": f"Please pick one option.\n\n{brief}\nType **Bayesian optimization** or **Random search**."}
+                    {
+                        "role": "assistant",
+                        "content": f"Please pick one option.\n\n{brief}\nType **Bayesian optimization** or **Random search**.",
+                    }
                 )
                 return st
 
         # -------------------- Preprocessing / navigation logic --------------------
         if stage == "ask_preprocess":
+            # User wants to jump straight to training
             if wants_train(text):
                 st["stage"] = "preview_download"
                 st["show_only_preview"] = False
@@ -684,7 +695,7 @@ class ChatOrchestrator:
                         "content": (
                             "Got it 👍 we’ll move towards training.\n\n"
                             "Below is a quick preview of your data and the **Train baselines** controls. "
-                            "You can still adjust preprocessing later if needed."
+                            "I’ll still handle basic cleaning automatically in the background."
                         ),
                     }
                 )
@@ -692,8 +703,10 @@ class ChatOrchestrator:
 
             yes_words = {"yes", "y", "yeah", "yep", "ok", "okay", "sure"}
             if text in yes_words:
-                # NEW: automatic preprocessing — no prep_menu / wizard message
+                # NEW: automatic preprocessing — no wizard / menu
                 st = self._auto_plan_preprocessing(st)
+                st["stage"] = "preview_download"
+                st["show_only_preview"] = True
                 st["messages"].append(
                     {
                         "role": "assistant",
@@ -701,27 +714,31 @@ class ChatOrchestrator:
                             "Great, I’ll **automatically clean the data** for you now — "
                             "dropping duplicate rows, removing any all-NaN columns, and "
                             "choosing sensible strategies for missing values.\n\n"
-                            "Once that’s done, I’ll show you a **preprocessed preview**."
+                            "Once that’s done, you’ll see a **preprocessed preview** below."
                         ),
                     }
                 )
                 return st
             else:
+                # User said "no" or something else → skip explicit preprocessing,
+                # still allow preview/training.
                 st["stage"] = "preview_download"
                 st["show_only_preview"] = True
                 st["messages"].append(
                     {
                         "role": "assistant",
                         "content": (
-                            "Okay, we’ll skip preprocessing for now. Say **preprocess** anytime to begin.\n\n"
+                            "Okay, we’ll skip any extra preprocessing for now.\n\n"
                             "Here’s the **data preview** and a **download option** below.\n"
-                            "Would you like to **continue preprocessing** or **proceed to training**?"
+                            "You can go **straight to training** whenever you’re ready."
                         ),
                     }
                 )
-            return st
+                return st
 
-        if stage in {"prep_menu", "preview_download"}:
+        # Main behaviour once we are past the initial question: only preview / training / tuning
+        if stage == "preview_download":
+            # User wants training
             if wants_train(text):
                 st["stage"] = "preview_download"
                 st["show_only_preview"] = False
@@ -737,12 +754,7 @@ class ChatOrchestrator:
                 )
                 return st
 
-            if "preprocess" in text and stage != "prep_menu":
-                st["stage"] = "prep_menu"
-                st["show_only_preview"] = False
-                st["messages"].append({"role": "assistant", "content": self._menu_message(st)})
-                return st
-
+            # User explicitly asks for preview again
             if wants_preview(text):
                 st["stage"] = "preview_download"
                 st["show_only_preview"] = True
@@ -751,86 +763,42 @@ class ChatOrchestrator:
                         "role": "assistant",
                         "content": (
                             "Here’s the **data preview** and a **download option** below.\n\n"
-                            "Would you like to **continue preprocessing** or **proceed to training**? "
-                            "_(You can run tuning after training.)_"
+                            "After checking it, you can proceed to **training** or ask me more questions."
                         ),
                     }
                 )
                 return st
 
-            if wants_continue(text) or text in {"yes", "y"}:
-                st["stage"] = "prep_menu"
-                st["show_only_preview"] = False
-                st["messages"].append({"role": "assistant", "content": self._menu_message(st)})
-                return st
-
-            if "missing" in text:
-                st["stage"] = "prep_missing"
-                st["messages"].append({"role": "assistant", "content": self._missing_intro(st)})
-                return st
-            if "duplicate" in text or "duplicates" in text:
-                st["stage"] = "prep_duplicates"
-                st["messages"].append({"role": "assistant", "content": self._dups_intro(st)})
-                return st
-            if "type" in text or "dtype" in text:
-                st["stage"] = "prep_dtypes"
-                st["messages"].append({"role": "assistant", "content": self._dtypes_intro(st)})
-                return st
-            if "drop" in text and "nan" in text:
-                st["stage"] = "prep_drop_all_nan"
-                st["messages"].append({"role": "assistant", "content": self._drop_all_nan_intro(st)})
-                return st
-            if "rename" in text:
-                st["stage"] = "prep_rename"
-                st["messages"].append({"role": "assistant", "content": self._rename_intro(st)})
-                return st
-
-            if stage == "prep_menu":
-                st["messages"].append({"role": "assistant", "content": self._menu_message(st)})
-            else:
+            # If user types "preprocess" later, just re-run automatic plan + preview
+            if "preprocess" in text or "pre-processing" in text:
+                st = self._auto_plan_preprocessing(st)
+                st["stage"] = "preview_download"
+                st["show_only_preview"] = True
                 st["messages"].append(
                     {
                         "role": "assistant",
-                        "content": "Say **preprocess** to start, **preview** to see the data, or **train** to move towards training.",
+                        "content": (
+                            "I’ve refreshed the **automatic preprocessing** for you and updated "
+                            "the **preprocessed preview** below."
+                        ),
                     }
                 )
-            return st
+                return st
 
-        # In method-specific stages, buttons drive most changes, but allow jumps
-        if wants_train(text):
-            st["stage"] = "preview_download"
-            st["show_only_preview"] = False
-            st["messages"].append(
-                {
-                    "role": "assistant",
-                    "content": (
-                        "No problem, we can move on.\n"
-                        "Here’s a preview plus the **Train baselines** controls so you can start training."
-                    ),
-                }
-            )
-            return st
-
-        if wants_preview(text):
-            st["stage"] = "preview_download"
-            st["show_only_preview"] = True
-            st["messages"].append(
-                {
-                    "role": "assistant",
-                    "content": (
-                        "Here’s the **data preview** and a **download option** below.\n\n"
-                        "Would you like to **continue preprocessing** or **proceed to training**? "
-                        "_(You can run tuning after training.)_"
-                    ),
-                }
-            )
-            return st
-
-        if wants_continue(text) or text in {"menu", "back", "go back"}:
-            st["stage"] = "prep_menu"
-            st["show_only_preview"] = False
-            st["messages"].append({"role": "assistant", "content": self._menu_message(st)})
-            return st
+            # Generic "continue" → gentle nudge towards training
+            if wants_continue(text) or text in {"yes", "y"}:
+                st["stage"] = "preview_download"
+                st["show_only_preview"] = False
+                st["messages"].append(
+                    {
+                        "role": "assistant",
+                        "content": (
+                            "Let’s keep going 🚀\n"
+                            "You can now **select a target column** and run **Train baselines** below."
+                        ),
+                    }
+                )
+                return st
 
         # -------------------- QA fallback for workflow questions --------------------
         if self._looks_like_qa(text):
@@ -844,10 +812,14 @@ class ChatOrchestrator:
         st["messages"].append(
             {
                 "role": "assistant",
-                "content": "Use the controls above, then click **Done** (or type **preview**, **train**, or **continue**).",
+                "content": (
+                    "You can **preview the data**, **start training**, ask me to **tune the model**, "
+                    "or just ask a question about what’s been done so far."
+                ),
             }
         )
         return st
+
 
     # -------------------- Helper messages --------------------
     def _menu_message(self, st: Dict[str, Any]) -> str:

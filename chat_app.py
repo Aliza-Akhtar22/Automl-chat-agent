@@ -711,10 +711,7 @@ def ui_preview_and_download():
     # 👉 Show preview ONLY if the user asked for it
     if not S2.get("show_only_preview", False):
         # User didn't ask for preview: just show training UI (before training)
-        if S2.get("train_result") is None and not S2.get("want_train", False):
-            ui_train_inline()
-        else:
-            ui_train_inline()
+        ui_train_inline()
         return
 
     # --- Render on-demand preview ---
@@ -748,11 +745,10 @@ def ui_preview_and_download():
         ui_train_inline()
     else:
         if S2.get("show_only_preview", False):
-            st.write(
-                "Would you like to **continue preprocessing** or **go to training**?"
-            )
+            st.write("You can now **go to training** or ask me questions about this preview.")
         else:
             ui_train_inline()
+
 
 
 # ---------- Upload gate ----------
