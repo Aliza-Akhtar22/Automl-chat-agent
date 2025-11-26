@@ -322,25 +322,53 @@ class ChatOrchestrator:
         return any(k in t for k in keywords)
     
     # -------------------- Planner helpers (multi-step requests) --------------------
-    def _is_full_pipeline_request(self, text: str) -> bool:
-        """
-        Detect multi-step / end-to-end intents like:
-        - "do preprocess and train for me"
-        - "clean data, train and tune"
-        - "run the full automl pipeline"
-        """
-        t = text.lower()
-        phrases = [
-            "preprocess and train",
-            "do preprocess and train",
-            "do the preprocess and train",
-            "do everything end to end",
-            "do everything end-to-end",
-            "run the full pipeline",
-            "run full automl",
-            "do everything for me",
-        ]
-        return any(p in t for p in phrases)
+def _is_full_pipeline_request(self, text: str) -> bool:
+    """
+    Detect multi-step / end-to-end intents even if the user words them differently.
+    """
+
+    t = text.lower()
+
+    # Strong explicit phrases (keep your originals)
+    strong_phrases = [
+        "preprocess and train",
+        "do preprocess and train",
+        "do the preprocess and train",
+        "do everything end to end",
+        "do everything end-to-end",
+        "run the full pipeline",
+        "run full automl",
+        "do everything for me",
+    ]
+    if any(p in t for p in strong_phrases):
+        return True
+
+    # NEW: keyword-based detection
+    preprocess_keywords = [
+        "preprocess",
+        "clean the data",
+        "clean data",
+        "prepare the data",
+        "prepare data",
+        "do cleaning",
+        "fix the data",
+    ]
+    train_keywords = [
+        "train",
+        "train baselines",
+        "train baseline",
+        "train the model",
+        "train models",
+        "run training",
+        "start training",
+        "prepare training",
+    ]
+
+    if any(pk in t for pk in preprocess_keywords) and any(tk in t for tk in train_keywords):
+        return True
+
+    return False
+
 
     def _plan_preprocess_only(self, st: Dict[str, Any]) -> Dict[str, Any]:
         """
