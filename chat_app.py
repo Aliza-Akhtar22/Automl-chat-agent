@@ -677,8 +677,8 @@ def ui_preview_and_download():
     - Shows preview ONLY when user explicitly asked (show_only_preview == True)
       AND only before training. Never after training/tuning.
     """
-    # 🔄 Show spinner while preprocessing runs
-    with st.spinner("Applying preprocessing to your data… ⏳"):
+    # 🔥 NEW: show spinner while preprocessing runs (multi-step heavy queries)
+    with st.spinner("Preprocessing your data... this may take a moment ⏳"):
         st.session_state["chat_state"] = orch.run_preprocess_now(
             st.session_state["chat_state"]
         )
