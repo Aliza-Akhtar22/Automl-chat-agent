@@ -7,13 +7,14 @@ import pandas as pd
 import numpy as np
 
 from app.agents.llm_utils import chat_once
-from app.agents.prompts import SYSTEM_DATA_SUMMARY, SYSTEM_QA_AGENT
+from app.agents.prompts import (
+    SYSTEM_DATA_SUMMARY,
+    SYSTEM_QA_AGENT,
+    SYSTEM_PREPROCESS_PLANNER,  # NEW: planner prompt
+)
 from app.core.preprocessing import coerce_nulls, missing_report, dtypes_dict
 from app.core.utils import best_model_by_task
 from app.agents.runner import run_automl_graph
-
-from app.agents.router import classify_intent
-from app.agents.pipeline_planner import plan_pipeline, PipelinePlan
 
 
 # --------------- Conversation Stages ---------------
@@ -109,10 +110,6 @@ class ChatOrchestrator:
         st["require_approval"] = False
         st["approved"] = False
         st["supervisor_reason"] = ""
-
-        # Planner-related flags
-        st.setdefault("planner_plan", None)           # last computed PipelinePlan
-        st.setdefault("planner_waiting_approval", False)
 
         st["last_bot"] = None
         return st
@@ -334,167 +331,112 @@ class ChatOrchestrator:
         ]
         return any(k in t for k in keywords)
 
-    # =====================================================================
-    #             PIPELINE / PLANNER HELPERS (NEW)
-    # =====================================================================
-    def _handle_pipeline_intent(self, route: Dict[str, Any], st: Dict[str, Any]) -> Dict[str, Any]:
-        """Handle multi-step / end-to-end requests via the planner."""
-        if st.get("clean_df") is None and st.get("raw_df") is None:
-            st["messages"].append(
-                {"role": "assistant", "content": "Please upload a dataset first, then I can run the pipeline for you."}
-            )
+    # -------------------- Automatic preprocessing planner --------------------
+    def _auto_plan_preprocessing(self, st: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Use the LLM planner to decide preprocessing strategies internally
+        (no user wizard). We will:
+          - always DROP duplicate rows,
+          - always DROP all-NaN columns (if any),
+          - choose per-column missing strategies via LLM,
+        then store everything in the pp_* config fields so the graph
+        can actually run preprocessing.
+        """
+        st = st.copy()
+        df = st.get("clean_df")
+        if df is None:
             return st
 
-        goal = route.get("pipeline_goal", "preprocess_train_tune")
+        miss = missing_report(df)
+        all_nan_cols = miss["all_nan_columns"]
+        missing_by_column = miss["missing_by_column"]
+        dtypes = dtypes_dict(df)
 
-        # Build plan using the planner
-        plan: PipelinePlan = plan_pipeline(st, goal)
-        st["planner_plan"] = plan
-        st["planner_waiting_approval"] = True
+        user_payload = {
+            "columns_and_dtypes": dtypes,
+            "missing_by_column": missing_by_column,
+            "all_nan_columns": all_nan_cols,
+            "notes": (
+                "Please propose a good preprocessing plan for non-technical users. "
+                "Always drop duplicate rows. Always include all-NaN columns in drop_cols. "
+                "For each column that has missing values > 0, pick a reasonable strategy."
+            ),
+        }
 
-        # Present plan
-        st["messages"].append(
-            {
-                "role": "assistant",
-                "content": (
-                    f"Here is the plan I propose based on your request (**{goal}**):\n\n"
-                    f"{plan['summary_markdown']}\n\n"
-                    "If this looks good, please confirm and I will start with the preprocessing steps internally."
-                ),
-            }
-        )
-        return st
-
-    def _maybe_process_pipeline_confirmation(self, raw_text: str, st: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """If we are waiting for pipeline approval, interpret the user's yes/no."""
-        if not st.get("planner_waiting_approval"):
-            return None
-
-        t = (raw_text or "").strip().lower()
-        yes_words = {"yes", "y", "yeah", "yep", "ok", "okay", "sure", "go ahead", "proceed", "do it"}
-        no_words = {"no", "n", "nope", "not now", "stop", "cancel"}
-
-        if t in yes_words:
-            plan = st.get("planner_plan")
-            if not plan:
-                st["planner_waiting_approval"] = False
-                st["messages"].append(
-                    {
-                        "role": "assistant",
-                        "content": "I seem to have lost the internal plan details. Please ask again to run the pipeline.",
-                    }
-                )
-                return st
-            return self._execute_pipeline_plan(plan, st)
-
-        if t in no_words:
-            st["planner_waiting_approval"] = False
-            st["planner_plan"] = None
-            st["messages"].append(
-                {
-                    "role": "assistant",
-                    "content": (
-                        "Understood — I won’t run the automatic pipeline.\n"
-                        "You can still preprocess step-by-step or start training whenever you like."
-                    ),
-                }
+        try:
+            raw = chat_once(
+                system=SYSTEM_PREPROCESS_PLANNER,
+                user=json.dumps(user_payload),
+                model="gpt-4o-mini",
+                temperature=0.0,
             )
-            return st
-
-        # If user says something else, re-ask briefly
-        st["messages"].append(
-            {
-                "role": "assistant",
-                "content": "Please reply with **yes** to proceed with this plan, or **no** to cancel it.",
+            plan = json.loads(raw)
+        except Exception:
+            # Fallback: simple defaults
+            plan = {
+                "drop_cols": all_nan_cols,
+                "duplicate_strategy": "drop",
+                "missing_strategy": {
+                    c: "mean" for c, cnt in missing_by_column.items() if cnt > 0
+                },
+                "column_mapping": {},
+                "type_overrides": {},
+                "preserve_column_names": False,
             }
+
+        # Enforce our business rules on top
+        drop_cols = plan.get("drop_cols") or all_nan_cols
+        duplicate_strategy = "drop"  # always drop duplicates
+        missing_strategy = plan.get("missing_strategy") or {
+            c: "mean" for c, cnt in missing_by_column.items() if cnt > 0
+        }
+        column_mapping = plan.get("column_mapping") or {}
+        type_overrides = plan.get("type_overrides") or {}
+        preserve_column_names = bool(column_mapping) or bool(
+            plan.get("preserve_column_names", False)
         )
-        return st
 
-    def _execute_pipeline_plan(self, plan: PipelinePlan, state: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Execute ONLY the preprocessing part with default strategies, internally.
-        Wizard remains available afterwards (Option A).
-        """
-        st = state.copy()
-        st["planner_waiting_approval"] = False
+        # Store into config buckets
+        st["pp_drop_all_nan_cols"] = drop_cols
+        st["pp_duplicate_strategy"] = duplicate_strategy
+        st["pp_missing_strategy"] = missing_strategy
+        st["pp_column_mapping"] = column_mapping
+        st["pp_type_overrides"] = type_overrides
+        st["pp_preserve_column_names"] = preserve_column_names
 
-        cfg = plan.get("preprocess_config", {})
+        # Mark steps as done (so wizard doesn’t nag)
+        st["done_missing"] = bool(missing_strategy)
+        st["done_duplicates"] = True
+        st["done_drop_all_nan"] = bool(drop_cols)
+        st["done_dtypes"] = bool(type_overrides)
+        st["done_rename"] = bool(column_mapping)
 
-        # Map planner config → graph fields (same ones used by run_preprocess_now)
-        st["drop_cols"] = cfg.get("drop_all_nan_cols", [])
-        st["duplicate_strategy"] = cfg.get("duplicate_strategy", "drop")
-        st["missing_strategy"] = cfg.get("missing_strategy") or None
-        st["column_mapping"] = cfg.get("column_mapping") or None
-        st["type_overrides"] = cfg.get("type_overrides") or None
-        st["preserve_column_names"] = bool(cfg.get("column_mapping"))
+        # We want to go straight to preview after preprocessing
+        st["stage"] = "preview_download"
+        st["show_only_preview"] = True
 
-        # Trigger preprocessing via LangGraph
+        # Ask the graph to run preprocessing
         st["want_preprocess"] = True
-        st["approved"] = True  # internal HITL gate already handled via planner confirmation
 
-        # Informational messages (as if running step-by-step)
-        st["messages"].append(
-            {
-                "role": "assistant",
-                "content": (
-                    "I’m now applying the planned preprocessing steps internally:\n"
-                    "- Dropping duplicate rows using strategy **drop**.\n"
-                    "- Dropping columns that are entirely missing (all-NaN).\n"
-                    "- Handling remaining missing values per column with simple strategies."
-                ),
-            }
-        )
-
-        out = run_automl_graph(st)
-
-        # Finishing message + preview
-        out["messages"].append(
-            {
-                "role": "assistant",
-                "content": (
-                    "✅ Preprocessing is complete.\n\n"
-                    "I’ve run the preprocessing internally using the agreed strategies. "
-                    "A preview of the preprocessed dataset (with a download option) is now shown below.\n\n"
-                    "From here, you can:\n"
-                    "- Proceed to **training** (choose your target column), or\n"
-                    "- Open the **preprocessing wizard** if you’d like to further adjust or override any steps."
-                ),
-            }
-        )
-
-        out["stage"] = "preview_download"
-        out["show_only_preview"] = True
-        return out
+        return st
 
     # -------------------- Router for user free text --------------------
     def handle(self, user_text: str, state: Dict[str, Any]) -> Dict[str, Any]:
         """
         Conversation brain:
-        - Uses a lightweight router to detect multi-step pipeline requests.
-        - For pipeline requests → Planner builds a plan, asks for approval,
-          and then executes preprocessing internally using default strategies.
-        - For everything else, falls back to the existing single-step /
-          wizard / training / tuning / QA logic.
+        - Decodes user intent.
+        - Sets high-level flags / stage.
+        - Triggers graph for **tuning** once the metric is known (defaults set).
+        - Preprocess execution is triggered separately by UI preview (run_preprocess_now).
+        - If the message looks like a *question*, route to the QA helper instead of
+          just saying "use the controls above".
         """
         st = state.copy()
         st["last_bot"] = None
 
-        raw_text = (user_text or "").strip()
-
-        # 0) If we are in a "waiting for pipeline approval" state, interpret yes/no first.
-        pipeline_result = self._maybe_process_pipeline_confirmation(raw_text, st)
-        if pipeline_result is not None:
-            return pipeline_result
-
-        # 1) Route intent (only pipeline vs non-pipeline)
-        route = classify_intent(raw_text)
-        if route.get("intent") == "pipeline":
-            return self._handle_pipeline_intent(route, st)
-
-        # ---------------- Original logic below (intact) ----------------
         stage = st.get("stage", "await_upload")
         tuning_stage = st.get("tuning_stage")
-        text = raw_text.lower()
+        text = (user_text or "").strip().lower()
 
         def wants_preview(t: str) -> bool:
             preview_words = ["preview", "show preview", "see preview", "download", "show data", "see data", "show table"]
@@ -588,7 +530,7 @@ class ChatOrchestrator:
 
             # If the user asks for metrics/leaderboard instead of yes/no → QA
             if self._looks_like_qa(text):
-                answer = self._qa_answer(raw_text, st)
+                answer = self._qa_answer(user_text, st)
                 st["messages"].append({"role": "assistant", "content": answer})
                 st["suppress_preview_once"] = True
                 return st
@@ -750,9 +692,20 @@ class ChatOrchestrator:
 
             yes_words = {"yes", "y", "yeah", "yep", "ok", "okay", "sure"}
             if text in yes_words:
-                st["stage"] = "prep_menu"
-                st["show_only_preview"] = False
-                st["messages"].append({"role": "assistant", "content": self._menu_message(st)})
+                # NEW: automatic preprocessing — no prep_menu / wizard message
+                st = self._auto_plan_preprocessing(st)
+                st["messages"].append(
+                    {
+                        "role": "assistant",
+                        "content": (
+                            "Great, I’ll **automatically clean the data** for you now — "
+                            "dropping duplicate rows, removing any all-NaN columns, and "
+                            "choosing sensible strategies for missing values.\n\n"
+                            "Once that’s done, I’ll show you a **preprocessed preview**."
+                        ),
+                    }
+                )
+                return st
             else:
                 st["stage"] = "preview_download"
                 st["show_only_preview"] = True
@@ -881,7 +834,7 @@ class ChatOrchestrator:
 
         # -------------------- QA fallback for workflow questions --------------------
         if self._looks_like_qa(text):
-            answer = self._qa_answer(raw_text, st)
+            answer = self._qa_answer(user_text, st)
             st["messages"].append({"role": "assistant", "content": answer})
             # Let the UI know not to auto-show preview in response to pure Q&A
             st["suppress_preview_once"] = True

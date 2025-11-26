@@ -673,15 +673,21 @@ def ui_train_inline():
 def ui_preview_and_download():
     """
     Preview area.
-    - Runs preprocessing if needed.
+    - Runs preprocessing once (via LangGraph) the first time we need a preview,
+      showing a spinner while it runs.
     - Shows preview ONLY when user explicitly asked (show_only_preview == True)
       AND only before training. Never after training/tuning.
     """
-    # 🔥 NEW: show spinner while preprocessing runs (multi-step heavy queries)
-    with st.spinner("Preprocessing your data... this may take a moment ⏳"):
-        st.session_state["chat_state"] = orch.run_preprocess_now(
-            st.session_state["chat_state"]
-        )
+    S2 = st.session_state["chat_state"]
+
+    # If we have data but no preprocessed frame yet, run preprocessing with spinner
+    if S2.get("clean_df") is not None and S2.get("pre_df") is None:
+        with st.spinner("Preprocessing your data… this may take a moment ⏳"):
+            st.session_state["chat_state"] = orch.run_preprocess_now(S2)
+            S2 = st.session_state["chat_state"]
+    else:
+        st.session_state["chat_state"] = S2
+
     S2 = st.session_state["chat_state"]
 
     # Hide preview/training while tuning chat is active
