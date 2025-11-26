@@ -341,7 +341,8 @@ def _df_for_training():
 def maybe_answer_qa(user_text: str, state: dict) -> str | None:
     """
     If the user is asking a question about metrics / status / preprocessing / tuning,
-    answer it via LLM using SYSTEM_QA_AGENT. Otherwise return None.
+    answer it via LLM using SYSTEM_QA_AGENT. Otherwise return None so the
+    orchestrator (router / planner / supervisor) can handle it.
     """
     txt = (user_text or "").strip().lower()
 
@@ -370,6 +371,20 @@ def maybe_answer_qa(user_text: str, state: dict) -> str | None:
         "go to preprocess part",
     ]
     if any(k in txt for k in nav_keywords) or txt.strip() in {"preview"}:
+        return None
+
+    # ✅ NEW: multi-step / full-pipeline requests → handled by planner/supervisor
+    multi_step_phrases = [
+        "preprocess and train",
+        "do preprocess and train",
+        "do the preprocess and train",
+        "do everything end to end",
+        "do everything end-to-end",
+        "run the full pipeline",
+        "run full automl",
+        "do everything for me",
+    ]
+    if any(p in txt for p in multi_step_phrases):
         return None
 
     # NEW: tuning / hyperparameter navigation is always handled by the orchestrator
@@ -528,6 +543,7 @@ def maybe_answer_qa(user_text: str, state: dict) -> str | None:
         return (
             f"The current best model is **{state.get('best_model_name','(unknown)')}**, and {joined}"
         )
+
 
 
 def ui_train_inline():

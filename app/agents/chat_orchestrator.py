@@ -64,7 +64,7 @@ class ChatOrchestrator:
         )
         st["stage"] = "ask_preprocess"
 
-        # User-config buckets (the wizard fills these incrementally)
+        # User-config buckets (the wizard / planner fills these)
         st.setdefault("pp_missing_strategy", {})      # col -> mean/median/mode/drop/fill
         st.setdefault("pp_duplicate_strategy", None)  # drop/keep_first/keep_last/mark
         st.setdefault("pp_type_overrides", {})        # col -> int/float/boolean/timestamp/string
@@ -72,7 +72,7 @@ class ChatOrchestrator:
         st.setdefault("pp_column_mapping", {})        # old -> new
         st.setdefault("pp_preserve_column_names", False)
 
-        # Bookkeeping for which wizard steps are done
+        # Bookkeeping for which steps are done
         st.setdefault("done_missing", False)
         st.setdefault("done_duplicates", False)
         st.setdefault("done_dtypes", False)
@@ -86,6 +86,10 @@ class ChatOrchestrator:
         st.setdefault("chosen_tune_method", None)     # default decided later (bayesian)
         st.setdefault("tune_metric", None)            # ask user; defaults by task if omitted
 
+        # Planner state (for multi-step "do everything" style requests)
+        st.setdefault("planner_stage", None)          # e.g. "preprocess_confirm"
+        st.setdefault("planner_pending_pp_config", None)
+
         # Supervisor / graph-related defaults
         st.setdefault("history", [])
         st.setdefault("errors", [])
@@ -98,6 +102,7 @@ class ChatOrchestrator:
 
         st["last_bot"] = None
         return st
+
 
     # -------------------- Hyperparameter tuning helpers --------------------
     def ask_tuning_opt_in(self, state: Dict[str, Any]) -> Dict[str, Any]:
@@ -315,6 +320,111 @@ class ChatOrchestrator:
             "have i done", "did we do", "completed", "finished",
         ]
         return any(k in t for k in keywords)
+    
+    # -------------------- Planner helpers (multi-step requests) --------------------
+    def _is_full_pipeline_request(self, text: str) -> bool:
+        """
+        Detect multi-step / end-to-end intents like:
+        - "do preprocess and train for me"
+        - "clean data, train and tune"
+        - "run the full automl pipeline"
+        """
+        t = text.lower()
+        phrases = [
+            "preprocess and train",
+            "do preprocess and train",
+            "do the preprocess and train",
+            "do everything end to end",
+            "do everything end-to-end",
+            "run the full pipeline",
+            "run full automl",
+            "do everything for me",
+        ]
+        return any(p in t for p in phrases)
+
+    def _plan_preprocess_only(self, st: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Planner for the first part of 'do preprocess and train for me'.
+
+        - Inspect data (duplicates, missing, all-NaN).
+        - Build an internal preprocessing plan:
+            * duplicate_strategy = 'drop'
+            * drop all-NaN columns
+            * per-column missing_strategy (mean/median/mode/fill/drop)
+        - Show the plan to the user and ask for approval.
+        - Do NOT actually run preprocessing yet.
+        """
+        st = st.copy()
+        df = st.get("clean_df")
+        if df is None:
+            st["messages"].append(
+                {
+                    "role": "assistant",
+                    "content": (
+                        "I need a dataset to start. Please upload a CSV first, "
+                        "then I can preprocess and train for you."
+                    ),
+                }
+            )
+            return st
+
+        # Basic stats
+        dup_count = int(len(df) - len(df.drop_duplicates()))
+        miss = df.isna().sum()
+        all_nan_cols = df.columns[miss == len(df)].tolist()
+        missing_cols = miss[miss > 0].sort_values(ascending=False)
+
+        # --- Build per-column missing strategies (simple heuristics) ---
+        missing_strategy: Dict[str, str] = {}
+        bullets = []
+
+        for col in missing_cols.index.tolist():
+            s = df[col]
+            if pd.api.types.is_numeric_dtype(s):
+                skew = float(np.abs(pd.Series(s).dropna().skew())) if s.dropna().size > 0 else 0.0
+                method = "median" if skew > 1.0 else "mean"
+            elif pd.api.types.is_datetime64_any_dtype(s):
+                method = "drop"
+            else:
+                nunq = s.nunique(dropna=True)
+                method = "mode" if nunq <= max(20, int(0.1 * len(s))) else "fill"
+            missing_strategy[col] = method
+            bullets.append(f"- **{col}** → `{method}`")
+
+        # Internal plan (NOT applied yet)
+        st["planner_pending_pp_config"] = {
+            "pp_duplicate_strategy": "drop",
+            "pp_drop_all_nan_cols": all_nan_cols,
+            "pp_missing_strategy": missing_strategy,
+        }
+        st["planner_stage"] = "preprocess_confirm"
+
+        # User-facing explanation
+        missing_summary = (
+            f"{len(missing_cols)} column(s) have missing values."
+            if len(missing_cols) > 0
+            else "no columns have missing values."
+        )
+        all_nan_summary = all_nan_cols if all_nan_cols else "none"
+        plan_lines = "\n".join(bullets) if bullets else "- *(No missing values to fix)*"
+
+        msg = (
+            "Here’s what I found in your data:\n\n"
+            f"- **Duplicates:** ~{dup_count} duplicate rows detected\n"
+            f"- **Missing values:** {missing_summary}\n"
+            f"- **All-NaN columns:** {all_nan_summary}\n\n"
+            "Here’s what I’ll do automatically **if you approve**:\n"
+            "- Drop exact duplicate rows.\n"
+            "- Drop the all-NaN columns listed above (if any).\n"
+            "- Handle missing values with these strategies:\n"
+            f"{plan_lines}\n\n"
+            "Shall I run this preprocessing plan now and then show you a "
+            "**preprocessed data preview**? (yes / no)"
+        )
+
+        st["messages"].append({"role": "assistant", "content": msg})
+        return st
+
 
     # -------------------- Automatic preprocessing planner --------------------
     def _auto_plan_preprocessing(self, st: Dict[str, Any]) -> Dict[str, Any]:
@@ -405,7 +515,7 @@ class ChatOrchestrator:
 
         return st
 
-    # -------------------- Router for user free text --------------------
+        # -------------------- Router for user free text --------------------
     def handle(self, user_text: str, state: Dict[str, Any]) -> Dict[str, Any]:
         """
         Conversation brain:
@@ -416,6 +526,8 @@ class ChatOrchestrator:
             * Saying "yes" at the preprocess question runs an internal plan
               (duplicates drop, all-NaN dropped, missing handled) and then
               shows a preprocessed preview.
+        - Multi-step commands like "do preprocess and train for me" go
+          through a planner: plan → show → ask approval → run.
         - If the message looks like a *question*, route to the QA helper instead
           of just saying "use the controls above".
         """
@@ -424,6 +536,7 @@ class ChatOrchestrator:
 
         stage = st.get("stage", "await_upload")
         tuning_stage = st.get("tuning_stage")
+        planner_stage = st.get("planner_stage")
         text_raw = (user_text or "").strip()
         text = text_raw.lower()
 
@@ -462,8 +575,67 @@ class ChatOrchestrator:
         def wants_tune(t: str) -> bool:
             return any(w in t for w in ["tune", "tuning", "optimize", "improve model", "hyperparameter"])
 
-        # -------- GLOBAL handling of direct "tune" requests --------
-        # User can say "tune the model" / "go to tuning part" at ANY time.
+        # ================== PLANNER: preprocess plan confirmation ==================
+        if planner_stage == "preprocess_confirm":
+            yes_words = {"yes", "y", "yeah", "yep", "ok", "okay", "sure"}
+            no_words = {"no", "n", "nope", "not now", "later"}
+
+            if text in yes_words:
+                plan = st.get("planner_pending_pp_config") or {}
+                st["pp_missing_strategy"] = plan.get("pp_missing_strategy", {})
+                st["pp_duplicate_strategy"] = plan.get("pp_duplicate_strategy") or "drop"
+                st["pp_drop_all_nan_cols"] = plan.get("pp_drop_all_nan_cols", [])
+
+                # Mark these preprocessing steps as done
+                if st["pp_missing_strategy"]:
+                    st["done_missing"] = True
+                if st["pp_duplicate_strategy"]:
+                    st["done_duplicates"] = True
+                if st["pp_drop_all_nan_cols"]:
+                    st["done_drop_all_nan"] = True
+
+                st["planner_stage"] = None
+                st["planner_pending_pp_config"] = None
+
+                # Move to preview stage; chat_app will run preprocessing with spinner
+                st["stage"] = "preview_download"
+                st["show_only_preview"] = True
+                st["messages"].append(
+                    {
+                        "role": "assistant",
+                        "content": (
+                            "Great 👍 I’ll run that preprocessing plan now and show you a "
+                            "**preprocessed data preview** below."
+                        ),
+                    }
+                )
+                return st
+
+            if text in no_words:
+                st["planner_stage"] = None
+                st["planner_pending_pp_config"] = None
+                st["messages"].append(
+                    {
+                        "role": "assistant",
+                        "content": (
+                            "No worries. I won’t run that plan.\n\n"
+                            "You can either ask me to **adjust the preprocessing** or let me "
+                            "handle it step by step."
+                        ),
+                    }
+                )
+                return st
+
+            # Clarify
+            st["messages"].append(
+                {
+                    "role": "assistant",
+                    "content": "Please reply with **yes** to run this preprocessing plan, or **no** to cancel it.",
+                }
+            )
+            return st
+
+        # ================== GLOBAL handling of direct "tune" requests ==================
         if wants_tune(text) and tuning_stage is None:
             # 1) If training has NOT been done yet -> explain that training is required first.
             if not st.get("train_result"):
@@ -683,6 +855,11 @@ class ChatOrchestrator:
                 )
                 return st
 
+        # ================== PLANNER ENTRY: multi-step / end-to-end ==================
+        # e.g. "do preprocess and train for me"
+        if self._is_full_pipeline_request(text):
+            return self._plan_preprocess_only(st)
+
         # -------------------- Preprocessing / navigation logic --------------------
         if stage == "ask_preprocess":
             # User wants to jump straight to training
@@ -703,7 +880,7 @@ class ChatOrchestrator:
 
             yes_words = {"yes", "y", "yeah", "yep", "ok", "okay", "sure"}
             if text in yes_words:
-                # NEW: automatic preprocessing — no wizard / menu
+                # Simple "yes": automatic preprocessing — no planner preview.
                 st = self._auto_plan_preprocessing(st)
                 st["stage"] = "preview_download"
                 st["show_only_preview"] = True
@@ -819,6 +996,7 @@ class ChatOrchestrator:
             }
         )
         return st
+
 
 
     # -------------------- Helper messages --------------------
