@@ -12,6 +12,9 @@ from app.core.preprocessing import coerce_nulls, missing_report, dtypes_dict
 from app.core.utils import best_model_by_task
 from app.agents.runner import run_automl_graph
 
+from app.agents.router import classify_intent
+from app.agents.pipeline_planner import plan_pipeline, PipelinePlan
+
 
 # --------------- Conversation Stages ---------------
 # await_upload        -> ask user to upload
@@ -106,6 +109,10 @@ class ChatOrchestrator:
         st["require_approval"] = False
         st["approved"] = False
         st["supervisor_reason"] = ""
+
+        # Planner-related flags
+        st.setdefault("planner_plan", None)           # last computed PipelinePlan
+        st.setdefault("planner_waiting_approval", False)
 
         st["last_bot"] = None
         return st
@@ -327,23 +334,167 @@ class ChatOrchestrator:
         ]
         return any(k in t for k in keywords)
 
+    # =====================================================================
+    #             PIPELINE / PLANNER HELPERS (NEW)
+    # =====================================================================
+    def _handle_pipeline_intent(self, route: Dict[str, Any], st: Dict[str, Any]) -> Dict[str, Any]:
+        """Handle multi-step / end-to-end requests via the planner."""
+        if st.get("clean_df") is None and st.get("raw_df") is None:
+            st["messages"].append(
+                {"role": "assistant", "content": "Please upload a dataset first, then I can run the pipeline for you."}
+            )
+            return st
+
+        goal = route.get("pipeline_goal", "preprocess_train_tune")
+
+        # Build plan using the planner
+        plan: PipelinePlan = plan_pipeline(st, goal)
+        st["planner_plan"] = plan
+        st["planner_waiting_approval"] = True
+
+        # Present plan
+        st["messages"].append(
+            {
+                "role": "assistant",
+                "content": (
+                    f"Here is the plan I propose based on your request (**{goal}**):\n\n"
+                    f"{plan['summary_markdown']}\n\n"
+                    "If this looks good, please confirm and I will start with the preprocessing steps internally."
+                ),
+            }
+        )
+        return st
+
+    def _maybe_process_pipeline_confirmation(self, raw_text: str, st: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """If we are waiting for pipeline approval, interpret the user's yes/no."""
+        if not st.get("planner_waiting_approval"):
+            return None
+
+        t = (raw_text or "").strip().lower()
+        yes_words = {"yes", "y", "yeah", "yep", "ok", "okay", "sure", "go ahead", "proceed", "do it"}
+        no_words = {"no", "n", "nope", "not now", "stop", "cancel"}
+
+        if t in yes_words:
+            plan = st.get("planner_plan")
+            if not plan:
+                st["planner_waiting_approval"] = False
+                st["messages"].append(
+                    {
+                        "role": "assistant",
+                        "content": "I seem to have lost the internal plan details. Please ask again to run the pipeline.",
+                    }
+                )
+                return st
+            return self._execute_pipeline_plan(plan, st)
+
+        if t in no_words:
+            st["planner_waiting_approval"] = False
+            st["planner_plan"] = None
+            st["messages"].append(
+                {
+                    "role": "assistant",
+                    "content": (
+                        "Understood — I won’t run the automatic pipeline.\n"
+                        "You can still preprocess step-by-step or start training whenever you like."
+                    ),
+                }
+            )
+            return st
+
+        # If user says something else, re-ask briefly
+        st["messages"].append(
+            {
+                "role": "assistant",
+                "content": "Please reply with **yes** to proceed with this plan, or **no** to cancel it.",
+            }
+        )
+        return st
+
+    def _execute_pipeline_plan(self, plan: PipelinePlan, state: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Execute ONLY the preprocessing part with default strategies, internally.
+        Wizard remains available afterwards (Option A).
+        """
+        st = state.copy()
+        st["planner_waiting_approval"] = False
+
+        cfg = plan.get("preprocess_config", {})
+
+        # Map planner config → graph fields (same ones used by run_preprocess_now)
+        st["drop_cols"] = cfg.get("drop_all_nan_cols", [])
+        st["duplicate_strategy"] = cfg.get("duplicate_strategy", "drop")
+        st["missing_strategy"] = cfg.get("missing_strategy") or None
+        st["column_mapping"] = cfg.get("column_mapping") or None
+        st["type_overrides"] = cfg.get("type_overrides") or None
+        st["preserve_column_names"] = bool(cfg.get("column_mapping"))
+
+        # Trigger preprocessing via LangGraph
+        st["want_preprocess"] = True
+        st["approved"] = True  # internal HITL gate already handled via planner confirmation
+
+        # Informational messages (as if running step-by-step)
+        st["messages"].append(
+            {
+                "role": "assistant",
+                "content": (
+                    "I’m now applying the planned preprocessing steps internally:\n"
+                    "- Dropping duplicate rows using strategy **drop**.\n"
+                    "- Dropping columns that are entirely missing (all-NaN).\n"
+                    "- Handling remaining missing values per column with simple strategies."
+                ),
+            }
+        )
+
+        out = run_automl_graph(st)
+
+        # Finishing message + preview
+        out["messages"].append(
+            {
+                "role": "assistant",
+                "content": (
+                    "✅ Preprocessing is complete.\n\n"
+                    "I’ve run the preprocessing internally using the agreed strategies. "
+                    "A preview of the preprocessed dataset (with a download option) is now shown below.\n\n"
+                    "From here, you can:\n"
+                    "- Proceed to **training** (choose your target column), or\n"
+                    "- Open the **preprocessing wizard** if you’d like to further adjust or override any steps."
+                ),
+            }
+        )
+
+        out["stage"] = "preview_download"
+        out["show_only_preview"] = True
+        return out
+
     # -------------------- Router for user free text --------------------
     def handle(self, user_text: str, state: Dict[str, Any]) -> Dict[str, Any]:
         """
         Conversation brain:
-        - Decodes user intent.
-        - Sets high-level flags / stage.
-        - Triggers graph for **tuning** once the metric is known (defaults set).
-        - Preprocess execution is triggered separately by UI preview (run_preprocess_now).
-        - If the message looks like a *question*, route to the QA helper instead of
-          just saying "use the controls above".
+        - Uses a lightweight router to detect multi-step pipeline requests.
+        - For pipeline requests → Planner builds a plan, asks for approval,
+          and then executes preprocessing internally using default strategies.
+        - For everything else, falls back to the existing single-step /
+          wizard / training / tuning / QA logic.
         """
         st = state.copy()
         st["last_bot"] = None
 
+        raw_text = (user_text or "").strip()
+
+        # 0) If we are in a "waiting for pipeline approval" state, interpret yes/no first.
+        pipeline_result = self._maybe_process_pipeline_confirmation(raw_text, st)
+        if pipeline_result is not None:
+            return pipeline_result
+
+        # 1) Route intent (only pipeline vs non-pipeline)
+        route = classify_intent(raw_text)
+        if route.get("intent") == "pipeline":
+            return self._handle_pipeline_intent(route, st)
+
+        # ---------------- Original logic below (intact) ----------------
         stage = st.get("stage", "await_upload")
         tuning_stage = st.get("tuning_stage")
-        text = (user_text or "").strip().lower()
+        text = raw_text.lower()
 
         def wants_preview(t: str) -> bool:
             preview_words = ["preview", "show preview", "see preview", "download", "show data", "see data", "show table"]
@@ -437,7 +588,7 @@ class ChatOrchestrator:
 
             # If the user asks for metrics/leaderboard instead of yes/no → QA
             if self._looks_like_qa(text):
-                answer = self._qa_answer(user_text, st)
+                answer = self._qa_answer(raw_text, st)
                 st["messages"].append({"role": "assistant", "content": answer})
                 st["suppress_preview_once"] = True
                 return st
@@ -730,7 +881,7 @@ class ChatOrchestrator:
 
         # -------------------- QA fallback for workflow questions --------------------
         if self._looks_like_qa(text):
-            answer = self._qa_answer(user_text, st)
+            answer = self._qa_answer(raw_text, st)
             st["messages"].append({"role": "assistant", "content": answer})
             # Let the UI know not to auto-show preview in response to pure Q&A
             st["suppress_preview_once"] = True
@@ -944,4 +1095,3 @@ class ChatOrchestrator:
 
         out = run_automl_graph(st)
         return out
-    
