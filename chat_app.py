@@ -16,6 +16,9 @@ from app.agents.runner import run_automl_graph
 from app.core.utils import best_model_by_task
 from app.agents.llm_utils import chat_once
 from app.agents.prompts import SYSTEM_QA_AGENT  # Q&A prompt
+from app.agents.intent_router import IntentRouter  # NEW: lightweight intent router
+from app.agents.planner import Planner
+
 
 # ---------- Page ----------
 st.set_page_config(page_title="Chat AutoML", layout="wide")
@@ -77,6 +80,8 @@ if "chat_state" not in st.session_state:
     }
 
 orch = ChatOrchestrator()
+router = IntentRouter()  
+planner = Planner()       
 S = st.session_state["chat_state"]
 
 # ---------- Capture the ask-preprocess question to show AFTER preview ----------
@@ -341,8 +346,7 @@ def _df_for_training():
 def maybe_answer_qa(user_text: str, state: dict) -> str | None:
     """
     If the user is asking a question about metrics / status / preprocessing / tuning,
-    answer it via LLM using SYSTEM_QA_AGENT. Otherwise return None so the
-    orchestrator (router / planner / supervisor) can handle it.
+    answer it via LLM using SYSTEM_QA_AGENT. Otherwise return None.
     """
     txt = (user_text or "").strip().lower()
 
@@ -371,20 +375,6 @@ def maybe_answer_qa(user_text: str, state: dict) -> str | None:
         "go to preprocess part",
     ]
     if any(k in txt for k in nav_keywords) or txt.strip() in {"preview"}:
-        return None
-
-    # ✅ NEW: multi-step / full-pipeline requests → handled by planner/supervisor
-    multi_step_phrases = [
-        "preprocess and train",
-        "do preprocess and train",
-        "do the preprocess and train",
-        "do everything end to end",
-        "do everything end-to-end",
-        "run the full pipeline",
-        "run full automl",
-        "do everything for me",
-    ]
-    if any(p in txt for p in multi_step_phrases):
         return None
 
     # NEW: tuning / hyperparameter navigation is always handled by the orchestrator
@@ -543,7 +533,6 @@ def maybe_answer_qa(user_text: str, state: dict) -> str | None:
         return (
             f"The current best model is **{state.get('best_model_name','(unknown)')}**, and {joined}"
         )
-
 
 
 def ui_train_inline():
@@ -750,6 +739,13 @@ def ui_preview_and_download():
             mime="text/csv",
         )
 
+    # 🔹 NEW: planner-specific hint under the preview
+    if S2.get("planner_active") and S2.get("train_result") is None:
+        st.info(
+            "Now kindly **select the target column below and click _Train baselines_** "
+            "so I can train the model for you."
+        )
+
     st.markdown("---")
 
     if PENDING_ASK_PREPROC is not None:
@@ -858,46 +854,65 @@ else:
 # ---------- Chat input ----------
 user_text = st.chat_input("Tell me what to do…")
 if user_text:
-    # Log user message
+    # Log user message into conversation history
     S["messages"].append({"role": "user", "content": user_text})
 
-    # First, try to answer as a Q&A over current state (accuracy, tuning params, status, etc.)
-    qa_answer = maybe_answer_qa(user_text, S)
-    if qa_answer is not None:
-        S["messages"].append({"role": "assistant", "content": qa_answer})
-
-        # If this was a pure Q&A (no strong action words), suppress preview once
-        q = user_text.lower()
-        action_words = [
-            "train",
-            "training",
-            "preprocess",
-            "preview",
-            "upload",
-            "clean",
-            "duplicate",
-            "missing",
-            "dtype",
-            "type",
-            "rename",
-            "drop",
-            "nan",
-            "tune",
-            "optimize",
-        ]
-        if not any(w in q for w in action_words):
-            S["suppress_preview_once"] = True
-
-        st.session_state["chat_state"] = S
+    # 0) If Planner is waiting for YES/NO, handle that FIRST.
+    if S.get("planner_stage") == "await_confirm":
+        st.session_state["chat_state"] = planner.handle_confirmation(user_text, S)
         st.rerun()
 
-    # Otherwise, route to orchestrator for navigation / tuning / preprocessing moves
+    # 1) Route the intent first (qa / simple_action / multi_step)
+    intent = router.classify(user_text, S)
+    S["router_intent"] = intent  # store for debugging / downstream
+    kind = intent.get("kind", "simple_action")
+
+    # 2) QA: delegate to existing maybe_answer_qa helper
+    if kind == "qa":
+        qa_answer = maybe_answer_qa(user_text, S)
+        if qa_answer is not None:
+            S["messages"].append({"role": "assistant", "content": qa_answer})
+
+            # If this was a pure Q&A (no strong action words), suppress preview once
+            q = user_text.lower()
+            action_words = [
+                "train",
+                "training",
+                "preprocess",
+                "preview",
+                "upload",
+                "clean",
+                "duplicate",
+                "missing",
+                "dtype",
+                "type",
+                "rename",
+                "drop",
+                "nan",
+                "tune",
+                "optimize",
+            ]
+            if not any(w in q for w in action_words):
+                S["suppress_preview_once"] = True
+
+            st.session_state["chat_state"] = S
+            st.rerun()
+        # if qa_answer is None, just fall through to normal handling
+
+    # 3) Multi-step: go through Planner (plan preview + yes/no)
+    if kind == "multi_step":
+        st.session_state["chat_state"] = planner.handle_multi_step(user_text, S, intent)
+        st.rerun()
+
+    # 4) Simple actions: keep existing orchestrator behaviour
     st.session_state["chat_state"] = orch.handle(user_text, S)
     last_bot = st.session_state["chat_state"].pop("last_bot", None)
+
     if last_bot:
         st.session_state["chat_state"]["messages"].append(
             {"role": "assistant", "content": last_bot}
         )
+
         # If the user asked a simple Q&A (no action keywords), suppress preview once
         q = user_text.lower()
         action_words = [
@@ -919,4 +934,6 @@ if user_text:
         ]
         if not any(w in q for w in action_words):
             st.session_state["chat_state"]["suppress_preview_once"] = True
+
     st.rerun()
+
