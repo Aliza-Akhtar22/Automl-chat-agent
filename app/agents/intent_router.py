@@ -31,7 +31,17 @@ class IntentRouter:
         looks_like_question = self._looks_like_question(t)
         actions = self._extract_actions(t)
 
-        # --- 1) Multi-step / end-to-end detection ---
+        # --- 1) Explicit status / "have we done X" questions → QA ---
+        # e.g. "have we done preprocessing and training?",
+        #      "is tuning done?", "have we trained the model?"
+        if self._is_status_question(t):
+            return {
+                "kind": "qa",
+                "actions": actions,
+                "reason": "Status-style question about whether steps (preprocess/train/tune) have been done.",
+            }
+
+        # --- 2) Multi-step / end-to-end detection ---
         if self._looks_like_multi_step(t, actions):
             return {
                 "kind": "multi_step",
@@ -39,7 +49,7 @@ class IntentRouter:
                 "reason": "Text mentions multiple workflow actions or end-to-end behavior.",
             }
 
-        # --- 2) QA / analytical questions ---
+        # --- 3) QA / analytical questions ---
         if looks_like_question and self._mentions_analysis_concepts(t):
             return {
                 "kind": "qa",
@@ -47,7 +57,7 @@ class IntentRouter:
                 "reason": "Looks like a question about metrics/status/results, not a navigation command.",
             }
 
-        # --- 3) Simple action (single tool / navigation) ---
+        # --- 4) Simple action (single tool / navigation) ---
         if actions:
             return {
                 "kind": "simple_action",
@@ -55,7 +65,7 @@ class IntentRouter:
                 "reason": "Contains a single clear workflow action (preview/train/tune/preprocess).",
             }
 
-        # --- 4) Fallbacks ---
+        # --- 5) Fallbacks ---
         if looks_like_question:
             return {
                 "kind": "qa",
@@ -79,6 +89,47 @@ class IntentRouter:
             "was", "were", "can", "could", "should", "would",
         )
         return any(t.startswith(p) for p in q_starts)
+
+    def _is_status_question(self, t: str) -> bool:
+        """
+        Detect questions like:
+          - "have we done preprocessing and training?"
+          - "have we preprocessed the data?"
+          - "is tuning done?"
+        These should go straight to the QA helper instead of the multi-step planner.
+        """
+        status_starts = (
+            "have we",
+            "have i",
+            "did we",
+            "did i",
+            "has the",
+            "is ",
+            "are ",
+            "was ",
+            "were ",
+        )
+        status_keywords = [
+            "done",
+            "completed",
+            "finished",
+            "preprocess",
+            "preprocessed",
+            "preprocessing",
+            "cleaned",
+            "processed",
+            "training",
+            "trained",
+            "built",
+            "model",
+            "tuning",
+            "tuned",
+            "optimized",
+            "optimization",
+        ]
+        return any(t.startswith(s) for s in status_starts) and any(
+            k in t for k in status_keywords
+        )
 
     def _mentions_analysis_concepts(self, t: str) -> bool:
         """
