@@ -316,6 +316,7 @@ class ChatOrchestrator:
             "tuning", "hyperparameter", "best params", "parameters",
             "preprocess", "pre-processing", "cleaning done",
             "have i done", "did we do", "completed", "finished",
+            "result", "results", "explain", "explanation",
         ]
         return any(k in t for k in keywords)
 

@@ -144,6 +144,8 @@ class IntentRouter:
             "preprocess", "preprocessing", "cleaning done",
             "finished", "completed",
             "why is", "why my", "why the", "negative", "bad result",
+            # NEW: explanation / results-oriented queries
+            "result", "results", "explain", "explanation",
         ]
         return any(k in t for k in keywords)
 

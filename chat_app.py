@@ -374,7 +374,27 @@ def maybe_answer_qa(user_text: str, state: dict) -> str | None:
         "go to the preprocess",
         "go to preprocess part",
     ]
-    if any(k in txt for k in nav_keywords) or txt.strip() in {"preview"}:
+
+    # Status-style prefixes like "have we", "did we", "is", "are" etc.
+    status_prefixes = (
+        "have we",
+        "have i",
+        "did we",
+        "did i",
+        "has the",
+        "is ",
+        "are ",
+        "was ",
+        "were ",
+    )
+
+    # 👉 Only treat as pure navigation if it contains a nav phrase AND
+    #     does *not* look like a status question.
+    if (
+        any(k in txt for k in nav_keywords)
+        and not txt.startswith(status_prefixes)
+        and txt.strip() not in {"preview"}
+    ):
         return None
 
     # NEW: tuning / hyperparameter navigation is handled by the orchestrator,
@@ -412,6 +432,7 @@ def maybe_answer_qa(user_text: str, state: dict) -> str | None:
         "show",
         "give",
         "tell",
+        "explain",
     )
     looks_like_q = "?" in txt or txt.startswith(q_starts)
 
@@ -443,6 +464,10 @@ def maybe_answer_qa(user_text: str, state: dict) -> str | None:
         "finished",
         "steps",
         "so far",
+        "result",
+        "results",
+        "explain",
+        "explanation",
     ]
     mentions_project = any(k in txt for k in keywords)
 
@@ -535,6 +560,7 @@ def maybe_answer_qa(user_text: str, state: dict) -> str | None:
         return (
             f"The current best model is **{state.get('best_model_name','(unknown)')}**, and {joined}"
         )
+
 
 
 
