@@ -9,7 +9,8 @@ Your job is to describe it in plain English.
 - Mention which columns are completely empty (all NaN).
 - Do NOT render any data preview table.
 - Then tell the user you can help them: (1) remove duplicate rows, (2) fix missing values,
-(3) rename columns, (4) set correct data types, or (5) go straight to training.
+(3) rename columns, (4) set correct data types, or (5) go straight to training
+   by telling you which column should be used as the target.
 Keep it short and warm, not academic.
 """
 
@@ -87,8 +88,10 @@ Your job is to answer the user’s question in short, clear plain English, using
 Rules:
 
 - If the user asks about a metric (e.g. “accuracy”, “f1”, “r2”, “rmse”, “mae”):
-  * If training has NOT been run yet (train_done is false), say we haven’t trained any models yet and suggest training first.
-  * If training is done, report the requested metric for the current best model with 2–3 decimals (e.g. “The current best model has an accuracy of about 0.78.”).
+  * If training has NOT been run yet (train_done is false), say we haven’t trained any models yet
+    and suggest training first by telling you which column should be used as the target.
+  * If training is done, report the requested metric for the current best model with 2–3 decimals
+    (e.g. “The current best model has an accuracy of about 0.78.”).
   * If the requested metric does not exist, say so and point them to the leaderboard.
 
 - If the user asks whether something has been done yet (status checks):
@@ -112,7 +115,8 @@ Rules:
 - For training and tuning:
   * Training: use train_done.
   * Tuning: use tuned_done or tuning_done; if false but tuning_available is true, say tuning hasn’t been run yet but could be.
-  * Answer explicitly and suggest a reasonable next action (“train baselines”, “run tuning”, or “you’re all set, you can download the model”).
+  * Answer explicitly and suggest a reasonable next action (“train baselines” by telling you the target column,
+    “run tuning”, or “you’re all set, you can download the model”).
 
 - If the user asks to “show” the leaderboard or “what were the results”:
   * Summarize the top 1–2 models from leaderboard_top in words (model name + 1–2 key metrics), not as a table.
@@ -120,7 +124,8 @@ Rules:
 
 - If the user asks about tuning results or best parameters:
   * If tuned_done is false but tuning_available is true, base your advice on the current metric_values and the tuning rules below.
-  * If tuned_done is true, summarize tuned_test_metrics in 1–2 numbers and briefly describe tuned_best_params (only the most important ones, not a full JSON dump).
+  * If tuned_done is true, summarize tuned_test_metrics in 1–2 numbers and briefly describe tuned_best_params
+    (only the most important ones, not a full JSON dump).
 
 - Tuning recommendation logic:
   * For classification (task_type == "classification"):
@@ -134,7 +139,7 @@ Rules:
   * If cv_std > 0.05 or CV–test metric gap > 0.10, say results may be unstable and tuning or more data could help.
 
 - If the user asks “what should I do next?”:
-  * If no training yet → suggest training baselines.
+  * If no training yet → suggest they tell you which column is the target so you can train baselines.
   * If training done but no tuning and metrics are only “okay” → suggest tuning.
   * If tuning done and metrics are strong → suggest using/downloading the model or collecting more data.
 

@@ -207,6 +207,186 @@ class ChatOrchestrator:
         # Shortcuts like "maximize f1" or "optimize r2" are handled above already.
         # Provide safe defaults by task if user only says "yes".
         return "f1" if task_type == "classification" else "r2"
+    
+    def _parse_target_from_text(self, text: str, st: Dict[str, Any]) -> Optional[str]:
+        """
+        Detect if the user is specifying a target column in natural language.
+        Examples it should catch: 
+           - "use price as target"
+           - "target column is loan_status"
+           - "predict sale_price"
+           - "my target is churn"
+           - "use age as my label"
+           - "set target to income"
+        Returns the column name if matched AND exists in df, else None.
+        """
+        if not text:
+            return None
+
+        t = text.lower().strip()
+
+        # ---- Only attempt this if data is loaded ----
+        df = st.get("pre_df") or st.get("clean_df")
+        if df is None:
+            return None
+        cols = df.columns.tolist()
+        cols_lower = [c.lower() for c in cols]
+
+        # ---- Patterns that indicate target selection ----
+        trigger_phrases = [
+            "target is",
+            "target column is",
+            "use ",
+            "predict",
+            "label is",
+            "my label is",
+            "set target to",
+            "use column",
+            "i want to predict",
+            "i want to forecast",
+        ]
+        if not any(p in t for p in trigger_phrases):
+            return None
+
+        # ---- Extract the candidate column name from text ----
+        # Try exact match first
+        for c in cols:
+            if c.lower() in t:
+                return c
+
+        # Try token-by-token fuzzy matching for simple cases
+        tokens = t.replace(",", " ").replace(".", " ").split()
+        for tok in tokens:
+            if tok in cols_lower:
+                idx = cols_lower.index(tok)
+                return cols[idx]
+
+        return None
+
+    
+    def _run_baseline_training(self, st: Dict[str, Any], target_col: str) -> Dict[str, Any]:
+        """
+        Run baseline training via the LangGraph, assuming:
+          - a dataframe (pre_df or clean_df) is available
+          - target_col is a valid column name
+
+        It will:
+          - set st['target_col']
+          - infer the task_type if missing (classification vs regression)
+          - set the want_train/approved flags
+          - call run_automl_graph (with a second pass if preprocessing just got created)
+          - append a friendly assistant message about what happened
+        """
+        st = st.copy()
+
+        df = st.get("pre_df") or st.get("clean_df")
+        target = target_col
+
+        # Safety checks
+        if df is None:
+            st["messages"].append(
+                {
+                    "role": "assistant",
+                    "content": (
+                        "I don't see any data loaded yet. "
+                        "Please upload a CSV first, then tell me which column is the target."
+                    ),
+                }
+            )
+            return st
+
+        if not target or target not in df.columns:
+            st["messages"].append(
+                {
+                    "role": "assistant",
+                    "content": (
+                        "I tried to start training, but I couldn't find that column in your data.\n\n"
+                        "Please mention the target again using an existing column name. "
+                        "For example: `Use loan_status as my target`."
+                    ),
+                }
+            )
+            return st
+
+        # Persist the chosen target in state
+        st["target_col"] = target
+
+        # --- Infer task type if needed (classification vs regression) ---
+        if not st.get("task_type"):
+            try:
+                from app.agents.nodes import choose_task_type  # local import to avoid cycles
+
+                y = df[target]
+                task = choose_task_type(y)
+            except Exception:
+                y = df[target]
+                # Simple fallback: numeric → regression, else classification
+                if pd.api.types.is_numeric_dtype(y):
+                    task = "regression"
+                else:
+                    task = "classification"
+            st["task_type"] = task
+        else:
+            task = st["task_type"]
+
+        # Let the user know what we're doing
+        st["messages"].append(
+            {
+                "role": "assistant",
+                "content": (
+                    f"Great, I’ll use **{target}** as the target column.\n\n"
+                    f"I've detected this as a **{task.capitalize()}** problem.\n\n"
+                    "Now I’ll train a set of **baseline models** for you. "
+                    "This may take a moment ⏳."
+                ),
+            }
+        )
+
+        # --- Trigger training via the graph ---
+        st["want_train"] = True
+        st["approved"] = True  # pass HITL gate for training
+
+        out = run_automl_graph(st)
+
+        # If preprocessing ran first and training didn't yet, do one more pass
+        if (
+            out.get("train_result") is None
+            and out.get("pre_df") is not None
+            and out.get("want_train")
+        ):
+            out["approved"] = True
+            out = run_automl_graph(out)
+
+        # Final messaging based on outcome
+        tr = out.get("train_result")
+        if tr is not None and isinstance(tr.get("results"), pd.DataFrame):
+            df_res = tr["results"]
+            n_models = len(df_res)
+            out["messages"].append(
+                {
+                    "role": "assistant",
+                    "content": (
+                        f"✅ Done! I trained **{n_models} baseline model(s)** using **{target}** as the target.\n\n"
+                        "You can see the **leaderboard** and download the **best model** in the panel below.\n\n"
+                        "Feel free to ask me about the metrics (accuracy, F1, R², etc.) "
+                        "or say **tune the model** if you’d like to try hyperparameter tuning."
+                    ),
+                }
+            )
+        else:
+            out["messages"].append(
+                {
+                    "role": "assistant",
+                    "content": (
+                        "I tried to run baseline training, but it didn’t complete successfully.\n\n"
+                        "Please check the **errors / history** section above, or try again "
+                        "after adjusting the data or target column."
+                    ),
+                }
+            )
+
+        return out
+
 
     # -------------------- QA helpers --------------------
     def _qa_snapshot(self, st: Dict[str, Any]) -> Dict[str, Any]:
@@ -292,18 +472,21 @@ class ChatOrchestrator:
             if not snap.get("train_done"):
                 return (
                     "We haven’t trained any models yet, so metrics like accuracy or F1 "
-                    "are not available. Please choose a **target column** and click "
-                    "**Train baselines** to start training."
+                    "are not available.\n\n"
+                    "Please **tell me in the chat which column should be used as the target**.\n"
+                    "For example: `Use loan_status as my target`.\n\n"
+                    "I’ll detect the problem type and run **Train baselines** for you."
                 )
-            if not snap.get("tuned_done"):
+            if not snap.get("tuning_done"):
                 return (
-                    "We do have baseline models and metrics, but no hyperparameter tuning results yet. "
+                    "We do have baseline models and metrics, but no hyperparameter tuning results yet.\n\n"
                     "You can say **tune the model** if you’d like me to search for better settings."
                 )
             return (
                 "I couldn’t run the explanation helper right now, but you can inspect the "
                 "**leaderboard** table above for the latest metrics and tuned parameters."
             )
+
 
     def _looks_like_qa(self, text: str) -> bool:
         """Heuristic: does this message look like an analytical question?"""
@@ -422,6 +605,8 @@ class ChatOrchestrator:
               shows a preprocessed preview.
         - If the message looks like a *question*, route to the QA helper instead
           of just saying "use the controls above".
+        - Training is now fully chat-driven: user tells the target column in text,
+          and the orchestrator runs baselines automatically.
         """
         st = state.copy()
         st["last_bot"] = None
@@ -476,8 +661,10 @@ class ChatOrchestrator:
                         "role": "assistant",
                         "content": (
                             "Hyperparameter tuning comes **after training**.\n\n"
-                            "Please first choose a **target column** and click **Train baselines** "
-                            "in the training panel below. Once training finishes, "
+                            "First, please **tell me which column should be used as the target**.\n"
+                            "For example: `Use loan_status as my target`.\n\n"
+                            "I’ll detect whether it’s a classification or regression problem and "
+                            "run the **Train baselines** step for you. Once training finishes, "
                             "you can say **tune the model** again and I’ll start the tuning process."
                         ),
                     }
@@ -687,6 +874,15 @@ class ChatOrchestrator:
                 )
                 return st
 
+        # -------------------- Global chat-based target selection + training --------------------
+        # If we’re not in the middle of a tuning conversation, allow the user
+        # to set the target column via chat and immediately run baselines.
+        if tuning_stage is None:
+            target_col = self._parse_target_from_text(text_raw, st)
+            if target_col is not None:
+                out = self._run_baseline_training(st, target_col)
+                return out
+
         # -------------------- Preprocessing / navigation logic --------------------
         if stage == "ask_preprocess":
             # User wants to jump straight to training
@@ -698,8 +894,10 @@ class ChatOrchestrator:
                         "role": "assistant",
                         "content": (
                             "Got it 👍 we’ll move towards training.\n\n"
-                            "Below is a quick preview of your data and the **Train baselines** controls. "
-                            "I’ll still handle basic cleaning automatically in the background."
+                            "Below you’ll see a quick preview of your data and the **Train baselines** section.\n\n"
+                            "I’ll still handle basic cleaning automatically in the background.\n"
+                            "When you’re ready, just **tell me which column is the target** "
+                            "(for example: `Use loan_status as my target`) and I’ll train the baselines for you."
                         ),
                     }
                 )
@@ -734,7 +932,8 @@ class ChatOrchestrator:
                         "content": (
                             "Okay, we’ll skip any extra preprocessing for now.\n\n"
                             "Here’s the **data preview** and a **download option** below.\n"
-                            "You can go **straight to training** whenever you’re ready."
+                            "You can go **straight to training** whenever you’re ready by "
+                            "telling me which column should be the target."
                         ),
                     }
                 )
@@ -742,7 +941,7 @@ class ChatOrchestrator:
 
         # Main behaviour once we are past the initial question: only preview / training / tuning
         if stage == "preview_download":
-            # User wants training
+            # User wants training (but hasn’t directly specified a target in this message)
             if wants_train(text):
                 st["stage"] = "preview_download"
                 st["show_only_preview"] = False
@@ -750,9 +949,11 @@ class ChatOrchestrator:
                     {
                         "role": "assistant",
                         "content": (
-                            "Sure ✅ jumping ahead.\n"
-                            "Below you’ll see a data preview and the **Train baselines** section "
-                            "to start training your models."
+                            "Sure ✅ jumping ahead.\n\n"
+                            "Below you’ll see the data preview and the **Train baselines** section.\n\n"
+                            "Please **tell me which column is your target** in the chat, "
+                            "for example: `Use price as my target`. I’ll detect the task type "
+                            "and run the baseline models for you."
                         ),
                     }
                 )
@@ -767,7 +968,8 @@ class ChatOrchestrator:
                         "role": "assistant",
                         "content": (
                             "Here’s the **data preview** and a **download option** below.\n\n"
-                            "After checking it, you can proceed to **training** or ask me more questions."
+                            "After checking it, you can proceed to **training** by telling me "
+                            "which column to use as the target, or ask me more questions."
                         ),
                     }
                 )
@@ -798,7 +1000,8 @@ class ChatOrchestrator:
                         "role": "assistant",
                         "content": (
                             "Let’s keep going 🚀\n"
-                            "You can now **select a target column** and run **Train baselines** below."
+                            "You can now **tell me in the chat which column is the target**, "
+                            "and I’ll run **Train baselines** for you."
                         ),
                     }
                 )
@@ -817,12 +1020,13 @@ class ChatOrchestrator:
             {
                 "role": "assistant",
                 "content": (
-                    "You can **preview the data**, **start training**, ask me to **tune the model**, "
-                    "or just ask a question about what’s been done so far."
+                    "You can **preview the data**, **start training** by telling me your target column, "
+                    "ask me to **tune the model**, or just ask a question about what’s been done so far."
                 ),
             }
         )
         return st
+
 
 
     # -------------------- Helper messages --------------------

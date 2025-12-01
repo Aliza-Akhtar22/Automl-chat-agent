@@ -342,7 +342,6 @@ def _df_for_training():
     return df, S2
 
 
-# ------------ Q&A helper over current state ------------
 def maybe_answer_qa(user_text: str, state: dict) -> str | None:
     """
     If the user is asking a question about metrics / status / preprocessing / tuning,
@@ -375,7 +374,6 @@ def maybe_answer_qa(user_text: str, state: dict) -> str | None:
         "go to preprocess part",
     ]
 
-    # Status-style prefixes like "have we", "did we", "is", "are" etc.
     status_prefixes = (
         "have we",
         "have i",
@@ -388,8 +386,6 @@ def maybe_answer_qa(user_text: str, state: dict) -> str | None:
         "were ",
     )
 
-    # 👉 Only treat as pure navigation if it contains a nav phrase AND
-    #     does *not* look like a status question.
     if (
         any(k in txt for k in nav_keywords)
         and not txt.startswith(status_prefixes)
@@ -397,9 +393,6 @@ def maybe_answer_qa(user_text: str, state: dict) -> str | None:
     ):
         return None
 
-    # NEW: tuning / hyperparameter navigation is handled by the orchestrator,
-    # but we only treat it as navigation when it clearly sounds like a command,
-    # not when user is asking about status (e.g. "is tuning done?")
     tune_nav_keywords = [
         "tune the model",
         "start tuning",
@@ -414,7 +407,6 @@ def maybe_answer_qa(user_text: str, state: dict) -> str | None:
     if any(k in txt for k in tune_nav_keywords) and not any(w in txt for w in status_words):
         return None
 
-    # Heuristic: looks like a question?
     q_starts = (
         "what",
         "which",
@@ -436,7 +428,6 @@ def maybe_answer_qa(user_text: str, state: dict) -> str | None:
     )
     looks_like_q = "?" in txt or txt.startswith(q_starts)
 
-    # Mentions project concepts?
     keywords = [
         "accuracy",
         "f1",
@@ -474,16 +465,16 @@ def maybe_answer_qa(user_text: str, state: dict) -> str | None:
     if not (looks_like_q or mentions_project):
         return None
 
-    # Build snapshot from state
+    # -------- Build snapshot --------
     df_train, _ = _df_for_training()
     n_rows = int(df_train.shape[0]) if df_train is not None else 0
 
     best_row = state.get("best_model_row") or {}
-    metric_values = {}
-    for key in ["f1", "accuracy", "precision", "recall", "r2", "rmse", "mae"]:
-        val = best_row.get(key)
-        if val is not None and pd.notnull(val):
-            metric_values[key] = float(val)
+    metric_values = {
+        key: float(best_row.get(key))
+        for key in ["f1", "accuracy", "precision", "recall", "r2", "rmse", "mae"]
+        if best_row.get(key) is not None and pd.notnull(best_row.get(key))
+    }
 
     cv_score = best_row.get("cv_score")
     cv_std = best_row.get("cv_std")
@@ -505,12 +496,8 @@ def maybe_answer_qa(user_text: str, state: dict) -> str | None:
         "dataset_size": n_rows,
         "leaderboard_top": leaderboard_top,
         "metric_values": metric_values,
-        "cv_score": float(cv_score)
-        if cv_score is not None and pd.notnull(cv_score)
-        else None,
-        "cv_std": float(cv_std)
-        if cv_std is not None and pd.notnull(cv_std)
-        else None,
+        "cv_score": float(cv_score) if cv_score is not None and pd.notnull(cv_score) else None,
+        "cv_std": float(cv_std) if cv_std is not None and pd.notnull(cv_std) else None,
         "tuning_available": bool(tr is not None),
         "tuning_done": bool(tuned is not None),
         "tuned_metrics": tuned_metrics,
@@ -524,11 +511,9 @@ def maybe_answer_qa(user_text: str, state: dict) -> str | None:
         "train_done": bool(tr is not None),
     }
 
-    payload = {
-        "snapshot": snapshot,
-        "question": user_text,
-    }
+    payload = {"snapshot": snapshot, "question": user_text}
 
+    # -------- LLM Answer --------
     try:
         answer = chat_once(
             system=SYSTEM_QA_AGENT,
@@ -537,28 +522,35 @@ def maybe_answer_qa(user_text: str, state: dict) -> str | None:
             temperature=0.2,
         )
         return answer
+
     except Exception:
-        # Fallback: simple, rule-based answer
+        # -------- Fallback QA (updated for chat-based training) --------
         if not snapshot["train_done"]:
             return (
-                "You haven’t trained any models yet, so I don’t have accuracy or other metrics. "
-                "Choose a target column and click **Train baselines** to run training first."
+                "You haven’t trained any models yet, so I don’t have accuracy or other metrics.\n\n"
+                "Please **tell me which column should be used as the target**.\n"
+                "For example:\n"
+                "`Use price as target` or `Target column is loan_status`.\n\n"
+                "I’ll auto-detect the task type and run **Train baselines** for you."
             )
+
         if not metric_values:
             return (
-                "Training has completed, but I couldn’t read the metrics from the results. "
-                "Please check the leaderboard table above."
+                "Training is completed, but I couldn't interpret the metrics.\n"
+                "Please check the leaderboard displayed above."
             )
-        acc = metric_values.get("accuracy")
-        f1 = metric_values.get("f1")
+
         bits = []
-        if acc is not None:
-            bits.append(f"accuracy ≈ {acc:.3f}")
-        if f1 is not None:
-            bits.append(f"f1 ≈ {f1:.3f}")
-        joined = ", ".join(bits) if bits else "metrics are available in the leaderboard."
+        if metric_values.get("accuracy") is not None:
+            bits.append(f"accuracy ≈ {metric_values['accuracy']:.3f}")
+        if metric_values.get("f1") is not None:
+            bits.append(f"f1 ≈ {metric_values['f1']:.3f}")
+
+        joined = ", ".join(bits) if bits else "metrics are shown in the leaderboard."
+
         return (
-            f"The current best model is **{state.get('best_model_name','(unknown)')}**, and {joined}"
+            f"The current best model is **{state.get('best_model_name','(unknown)')}**, "
+            f"and {joined}."
         )
 
 
@@ -567,7 +559,10 @@ def maybe_answer_qa(user_text: str, state: dict) -> str | None:
 def ui_train_inline():
     """
     Training UI under preview or standalone if user skips explicit preprocessing.
-    Uses Supervisor + tools via run_automl_graph.
+    Now fully chat-driven:
+      - This function ONLY shows the training section + results.
+      - Target selection and the actual "train baselines" action
+        are handled via the chat/orchestrator.
     """
     # Hide the entire training block while tuning chat is active
     S2 = st.session_state["chat_state"]
@@ -581,42 +576,25 @@ def ui_train_inline():
 
     st.markdown("### Train baselines")
 
-    target = st.selectbox(
-        "Select your target column",
-        options=df_for_train.columns.tolist(),
-        key="chat_target_select",
-    )
+    # -------------------------------------------------
+    # 1) Pre-training: just show columns + chat hint
+    # -------------------------------------------------
+    if S2.get("train_result") is None:
+        cols_df = pd.DataFrame({"column": df_for_train.columns.tolist()})
+        st.caption("Available columns in your dataset")
+        st.dataframe(cols_df, use_container_width=True)
 
-    if target:
-        y = df_for_train[target]
-        task = choose_task_type(y)
-        S2["task_type"] = task
-        S2["target_col"] = target
-        st.info(f"Auto-detected task: **{task.capitalize()}**")
+        st.info(
+            "To start training, tell me **in the chat** which column is your target.\n\n"
+            "For example: `Use loan_status as my target`.\n\n"
+            "I’ll automatically detect whether it’s a **classification** or "
+            "**regression** problem and run the baseline training for you."
+        )
+        return
 
-        if st.button("Train baselines", key="chat_train_btn"):
-            with st.spinner("Training baselines... this may take a moment ⏳"):
-                S2["want_train"] = True
-                S2["approved"] = True
-
-                out = run_automl_graph(S2)
-
-                if (
-                    out.get("train_result") is None
-                    and out.get("pre_df") is not None
-                    and out.get("want_train")
-                ):
-                    out["approved"] = True
-                    out = run_automl_graph(out)
-
-            st.session_state["chat_state"] = out
-
-            if out.get("train_result") is not None:
-                st.success("Training completed. See results below.")
-            else:
-                st.error("Training did not complete. Please check errors / history.")
-
-    # ----- Show baseline results and ASK tuning via chat (no UI controls) -----
+    # -------------------------------------------------
+    # 2) Post-training: show leaderboard + downloads
+    # -------------------------------------------------
     S2 = st.session_state["chat_state"]
     if S2.get("tuning_stage") in {"ask_consent", "choose_metric", "choose_method"}:
         return
@@ -704,6 +682,7 @@ def ui_train_inline():
                 )
 
 
+
 def ui_preview_and_download():
     """
     Preview area.
@@ -768,11 +747,12 @@ def ui_preview_and_download():
             mime="text/csv",
         )
 
-    # 🔹 NEW: planner-specific hint under the preview
+    # 🔹 Planner-specific hint under the preview (now chat-based training)
     if S2.get("planner_active") and S2.get("train_result") is None:
         st.info(
-            "Now kindly **select the target column below and click _Train baselines_** "
-            "so I can train the model for you."
+            "Now kindly tell me **in the chat** which column should be used as the **target** "
+            "(for example: `Use loan_status as my target`).\n\n"
+            "I’ll automatically detect the task type and run **Train baselines** for you."
         )
 
     st.markdown("---")
@@ -786,9 +766,13 @@ def ui_preview_and_download():
         ui_train_inline()
     else:
         if S2.get("show_only_preview", False):
-            st.write("You can now **go to training** or ask me questions about this preview.")
+            st.write(
+                "You can now **ask me in the chat to train** (by telling me your target column) "
+                "or ask questions about this preview."
+            )
         else:
             ui_train_inline()
+
 
 
 
