@@ -905,8 +905,15 @@ if user_text:
         st.rerun()
 
     # 4) Simple actions: keep existing orchestrator behaviour
-    st.session_state["chat_state"] = orch.handle(user_text, S)
+    # If we are in the tuning metric stage, wrap the orchestrator call in a spinner
+    if S.get("tuning_stage") == "choose_metric":
+        with st.spinner("Tuning the best model... this may take a moment ⏳"):
+            st.session_state["chat_state"] = orch.handle(user_text, S)
+    else:
+        st.session_state["chat_state"] = orch.handle(user_text, S)
+
     last_bot = st.session_state["chat_state"].pop("last_bot", None)
+
 
     if last_bot:
         st.session_state["chat_state"]["messages"].append(
