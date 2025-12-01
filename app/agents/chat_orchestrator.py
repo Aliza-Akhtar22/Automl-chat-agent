@@ -211,32 +211,36 @@ class ChatOrchestrator:
     def _parse_target_from_text(self, text: str, st: Dict[str, Any]) -> Optional[str]:
         """
         Detect if the user is specifying a target column in natural language.
-        Examples it should catch: 
-           - "use price as target"
-           - "target column is loan_status"
-           - "predict sale_price"
-           - "my target is churn"
-           - "use age as my label"
-           - "set target to income"
-        Returns the column name if matched AND exists in df, else None.
+        Now also supports the user typing ONLY the column name (e.g. "loan_status").
         """
+        
         if not text:
             return None
 
         t = text.lower().strip()
 
-        # ---- Only attempt this if data is loaded ----
+    # ---- Only attempt this if data is loaded ----
         df = st.get("pre_df") or st.get("clean_df")
         if df is None:
             return None
+
         cols = df.columns.tolist()
         cols_lower = [c.lower() for c in cols]
 
-        # ---- Patterns that indicate target selection ----
+    # ----------------------------------------------------
+    # 1) NEW: If user simply typed a column name → accept it
+    # ----------------------------------------------------
+        if t in cols_lower:
+            idx = cols_lower.index(t)
+            return cols[idx]
+
+    # ----------------------------------------------------
+    # 2) Check trigger phrases (natural language instructions)
+    # ----------------------------------------------------
         trigger_phrases = [
             "target is",
             "target column is",
-            "use ",
+            "use",
             "predict",
             "label is",
             "my label is",
@@ -244,17 +248,21 @@ class ChatOrchestrator:
             "use column",
             "i want to predict",
             "i want to forecast",
-        ]
+            ]
+
         if not any(p in t for p in trigger_phrases):
             return None
 
-        # ---- Extract the candidate column name from text ----
-        # Try exact match first
+    # ----------------------------------------------------
+    # 3) Try exact match inside full text
+    # ----------------------------------------------------
         for c in cols:
             if c.lower() in t:
                 return c
 
-        # Try token-by-token fuzzy matching for simple cases
+    # ----------------------------------------------------
+    # 4) Fuzzy token match
+    # ----------------------------------------------------
         tokens = t.replace(",", " ").replace(".", " ").split()
         for tok in tokens:
             if tok in cols_lower:
