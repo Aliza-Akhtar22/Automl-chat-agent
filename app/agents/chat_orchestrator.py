@@ -259,19 +259,22 @@ class ChatOrchestrator:
             ),
             "tuning_available": bool(train_result),
             "train_done": bool(train_result),
-            "tuned_done": bool(tuned),
+
+            # --- tuning status ---
+            "tuning_done": bool(tuned),
             "tuned_best_params": tuned.get("best_params"),
-            "tuned_test_metrics": tuned.get("test_metrics"),
+            "tuned_metrics": tuned.get("test_metrics"),
+
+            # --- preprocessing status ---
             "preprocessing_done": bool(st.get("pre_df") is not None),
-            "pre_steps_done": {
-                "missing": st.get("done_missing"),
-                "duplicates": st.get("done_duplicates"),
-                "dtypes": st.get("done_dtypes"),
-                "drop_all_nan": st.get("done_drop_all_nan"),
-                "rename": st.get("done_rename"),
-            },
+            "done_missing": st.get("done_missing"),
+            "done_duplicates": st.get("done_duplicates"),
+            "done_dtypes": st.get("done_dtypes"),
+            "done_drop_all_nan": st.get("done_drop_all_nan"),
+            "done_rename": st.get("done_rename"),
         }
         return snapshot
+
 
     def _qa_answer(self, user_text: str, st: Dict[str, Any]) -> str:
         """Call the QA LLM to answer questions about accuracy, tuning, preprocessing, etc."""

@@ -377,23 +377,21 @@ def maybe_answer_qa(user_text: str, state: dict) -> str | None:
     if any(k in txt for k in nav_keywords) or txt.strip() in {"preview"}:
         return None
 
-    # NEW: tuning / hyperparameter navigation is always handled by the orchestrator
+    # NEW: tuning / hyperparameter navigation is handled by the orchestrator,
+    # but we only treat it as navigation when it clearly sounds like a command,
+    # not when user is asking about status (e.g. "is tuning done?")
     tune_nav_keywords = [
-        "tune",
-        "tuning",
-        "hyperparameter",
-        "hyper parameter",
-        "hyperparameter tuning",
-        "hyper parameter tuning",
-        "proceed with tuning",
+        "tune the model",
         "start tuning",
         "go to tuning",
-        "optimize the model",
-        "optimize model",
-        "improve the model",
-        "improve model",
+        "proceed with tuning",
+        "begin tuning",
+        "start hyperparameter tuning",
+        "go to hyperparameter tuning",
     ]
-    if any(k in txt for k in tune_nav_keywords):
+    status_words = ["done", "finished", "complete", "completed", "already"]
+
+    if any(k in txt for k in tune_nav_keywords) and not any(w in txt for w in status_words):
         return None
 
     # Heuristic: looks like a question?
@@ -439,8 +437,12 @@ def maybe_answer_qa(user_text: str, state: dict) -> str | None:
         "training",
         "preprocess",
         "preprocessing",
+        "cleaned",
+        "cleaning",
         "done",
         "finished",
+        "steps",
+        "so far",
     ]
     mentions_project = any(k in txt for k in keywords)
 
@@ -533,6 +535,7 @@ def maybe_answer_qa(user_text: str, state: dict) -> str | None:
         return (
             f"The current best model is **{state.get('best_model_name','(unknown)')}**, and {joined}"
         )
+
 
 
 def ui_train_inline():
