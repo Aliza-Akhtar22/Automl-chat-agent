@@ -213,40 +213,51 @@ class ChatOrchestrator:
         Detect if the user is specifying a target column in natural language.
 
         Supports:
-      - "use price as target"
-      - "target column is loan_status"
-      - "predict sale_price"
-      - "my target is churn"
-      - "use age as my label"
-      - "set target to income"
-      - and also just the bare column name, e.g. "loan_status"
+          - "use price as target"
+          - "target column is loan_status"
+          - "predict sale_price"
+          - "my target is churn"
+          - "use age as my label"
+          - "set target to income"
+          - and also just the bare column name, e.g. "loan_status"
         """
         
         if not text:
             return None
 
-        t = text.lower().strip()
+        t_raw = text.strip()
+        if not t_raw:
+            return None
+
+        t = t_raw.lower()
 
         # ---- Only attempt this if data is loaded ----
+        df: Optional[pd.DataFrame] = None
+
         pre_df = st.get("pre_df")
-        clean_df = st.get("clean_df")
-        if pre_df is not None:
+        if isinstance(pre_df, pd.DataFrame):
             df = pre_df
         else:
-            df = clean_df
+            clean_df = st.get("clean_df")
+            if isinstance(clean_df, pd.DataFrame):
+                df = clean_df
 
         if df is None:
             return None
 
-        cols = df.columns.tolist()
+        cols = list(df.columns)
         cols_lower = [c.lower() for c in cols]
 
-        # 1) NEW: If user simply typed a column name → accept it
+        # ----------------------------------------------------
+        # 1) If user simply typed a column name → accept it
+        # ----------------------------------------------------
         if t in cols_lower:
             idx = cols_lower.index(t)
             return cols[idx]
 
+        # ----------------------------------------------------
         # 2) Check trigger phrases (natural language instructions)
+        # ----------------------------------------------------
         trigger_phrases = [
             "target is",
             "target column is",
@@ -258,17 +269,20 @@ class ChatOrchestrator:
             "use column",
             "i want to predict",
             "i want to forecast",
-            ]
-
+        ]
         if not any(p in t for p in trigger_phrases):
             return None
 
+        # ----------------------------------------------------
         # 3) Try exact match inside full text
+        # ----------------------------------------------------
         for c in cols:
             if c.lower() in t:
                 return c
 
+        # ----------------------------------------------------
         # 4) Fuzzy token match
+        # ----------------------------------------------------
         tokens = t.replace(",", " ").replace(".", " ").split()
         for tok in tokens:
             if tok in cols_lower:
