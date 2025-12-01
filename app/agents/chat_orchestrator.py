@@ -211,7 +211,15 @@ class ChatOrchestrator:
     def _parse_target_from_text(self, text: str, st: Dict[str, Any]) -> Optional[str]:
         """
         Detect if the user is specifying a target column in natural language.
-        Now also supports the user typing ONLY the column name (e.g. "loan_status").
+
+        Supports:
+      - "use price as target"
+      - "target column is loan_status"
+      - "predict sale_price"
+      - "my target is churn"
+      - "use age as my label"
+      - "set target to income"
+      - and also just the bare column name, e.g. "loan_status"
         """
         
         if not text:
@@ -219,24 +227,26 @@ class ChatOrchestrator:
 
         t = text.lower().strip()
 
-    # ---- Only attempt this if data is loaded ----
-        df = st.get("pre_df") or st.get("clean_df")
+        # ---- Only attempt this if data is loaded ----
+        pre_df = st.get("pre_df")
+        clean_df = st.get("clean_df")
+        if pre_df is not None:
+            df = pre_df
+        else:
+            df = clean_df
+
         if df is None:
             return None
 
         cols = df.columns.tolist()
         cols_lower = [c.lower() for c in cols]
 
-    # ----------------------------------------------------
-    # 1) NEW: If user simply typed a column name → accept it
-    # ----------------------------------------------------
+        # 1) NEW: If user simply typed a column name → accept it
         if t in cols_lower:
             idx = cols_lower.index(t)
             return cols[idx]
 
-    # ----------------------------------------------------
-    # 2) Check trigger phrases (natural language instructions)
-    # ----------------------------------------------------
+        # 2) Check trigger phrases (natural language instructions)
         trigger_phrases = [
             "target is",
             "target column is",
@@ -253,16 +263,12 @@ class ChatOrchestrator:
         if not any(p in t for p in trigger_phrases):
             return None
 
-    # ----------------------------------------------------
-    # 3) Try exact match inside full text
-    # ----------------------------------------------------
+        # 3) Try exact match inside full text
         for c in cols:
             if c.lower() in t:
                 return c
 
-    # ----------------------------------------------------
-    # 4) Fuzzy token match
-    # ----------------------------------------------------
+        # 4) Fuzzy token match
         tokens = t.replace(",", " ").replace(".", " ").split()
         for tok in tokens:
             if tok in cols_lower:
@@ -287,8 +293,10 @@ class ChatOrchestrator:
         """
         st = st.copy()
 
-        df = st.get("pre_df") or st.get("clean_df")
-        target = target_col
+        # Pick the data frame to train on
+        pre_df = st.get("pre_df")
+        clean_df = st.get("clean_df")
+        df = pre_df if pre_df is not None else clean_df
 
         # Safety checks
         if df is None:
@@ -303,7 +311,7 @@ class ChatOrchestrator:
             )
             return st
 
-        if not target or target not in df.columns:
+        if target_col not in df.columns:
             st["messages"].append(
                 {
                     "role": "assistant",
@@ -317,17 +325,16 @@ class ChatOrchestrator:
             return st
 
         # Persist the chosen target in state
-        st["target_col"] = target
+        st["target_col"] = target_col
 
         # --- Infer task type if needed (classification vs regression) ---
         if not st.get("task_type"):
             try:
                 from app.agents.nodes import choose_task_type  # local import to avoid cycles
-
-                y = df[target]
+                y = df[target_col]
                 task = choose_task_type(y)
             except Exception:
-                y = df[target]
+                y = df[target_col]
                 # Simple fallback: numeric → regression, else classification
                 if pd.api.types.is_numeric_dtype(y):
                     task = "regression"
@@ -342,7 +349,7 @@ class ChatOrchestrator:
             {
                 "role": "assistant",
                 "content": (
-                    f"Great, I’ll use **{target}** as the target column.\n\n"
+                    f"Great, I’ll use **{target_col}** as the target column.\n\n"
                     f"I've detected this as a **{task.capitalize()}** problem.\n\n"
                     "Now I’ll train a set of **baseline models** for you. "
                     "This may take a moment ⏳."
@@ -374,7 +381,7 @@ class ChatOrchestrator:
                 {
                     "role": "assistant",
                     "content": (
-                        f"✅ Done! I trained **{n_models} baseline model(s)** using **{target}** as the target.\n\n"
+                        f"✅ Done! I trained **{n_models} baseline model(s)** using **{target_col}** as the target.\n\n"
                         "You can see the **leaderboard** and download the **best model** in the panel below.\n\n"
                         "Feel free to ask me about the metrics (accuracy, F1, R², etc.) "
                         "or say **tune the model** if you’d like to try hyperparameter tuning."
