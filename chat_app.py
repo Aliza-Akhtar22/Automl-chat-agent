@@ -709,6 +709,7 @@ def ui_preview_and_download():
 
     # Never show preview after training or tuning has been produced
     if S2.get("train_result") is not None or S2.get("tuned_result") is not None:
+        ui_train_inline()
         return
 
     if S2.get("pre_df") is None and S2.get("clean_df") is None:

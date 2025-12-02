@@ -5,6 +5,7 @@ import json
 
 import pandas as pd
 import numpy as np
+import streamlit as st_ui
 
 from app.agents.llm_utils import chat_once
 from app.agents.prompts import (
@@ -375,16 +376,17 @@ class ChatOrchestrator:
         st["want_train"] = True
         st["approved"] = True  # pass HITL gate for training
 
-        out = run_automl_graph(st)
+        with st_ui.spinner("Training baseline models… this may take a moment ⏳"):
+            out = run_automl_graph(st)
 
         # If preprocessing ran first and training didn't yet, do one more pass
-        if (
-            out.get("train_result") is None
-            and out.get("pre_df") is not None
-            and out.get("want_train")
-        ):
-            out["approved"] = True
-            out = run_automl_graph(out)
+            if (
+                out.get("train_result") is None
+                and out.get("pre_df") is not None
+                and out.get("want_train")
+            ):
+                out["approved"] = True
+                out = run_automl_graph(out)
 
         # Final messaging based on outcome
         tr = out.get("train_result")
