@@ -376,17 +376,16 @@ class ChatOrchestrator:
         st["want_train"] = True
         st["approved"] = True  # pass HITL gate for training
 
-        with st_ui.spinner("Training baseline models… this may take a moment ⏳"):
-            out = run_automl_graph(st)
+        out = run_automl_graph(st)
 
         # If preprocessing ran first and training didn't yet, do one more pass
-            if (
-                out.get("train_result") is None
-                and out.get("pre_df") is not None
-                and out.get("want_train")
-            ):
-                out["approved"] = True
-                out = run_automl_graph(out)
+        if (
+            out.get("train_result") is None
+            and out.get("pre_df") is not None
+            and out.get("want_train")
+        ):
+            out["approved"] = True
+            out = run_automl_graph(out)
 
         # Final messaging based on outcome
         tr = out.get("train_result")

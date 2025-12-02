@@ -924,7 +924,15 @@ if user_text:
         with st.spinner("Tuning the best model... this may take a moment ⏳"):
             st.session_state["chat_state"] = orch.handle(user_text, S)
     else:
-        st.session_state["chat_state"] = orch.handle(user_text, S)
+        will_train = (
+            S.get("tuning_stage") is None
+            and orch._parse_target_from_text(user_text, S) is not None
+        )
+        if will_train:
+            with st.spinner("Training the best model… this may take a moment ⏳"):
+                st.session_state["chat_state"] = orch.handle(user_text, S)
+        else:
+            st.session_state["chat_state"] = orch.handle(user_text, S)
 
     last_bot = st.session_state["chat_state"].pop("last_bot", None)
 
