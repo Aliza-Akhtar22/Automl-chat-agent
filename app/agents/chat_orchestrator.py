@@ -270,7 +270,6 @@ class ChatOrchestrator:
             "use column",
             "i want to predict",
             "i want to forecast",
-            "is my target column",
         ]
         if not any(p in t for p in trigger_phrases):
             return None
@@ -342,18 +341,6 @@ class ChatOrchestrator:
 
         # Persist the chosen target in state
         st["target_col"] = target_col
-
-        # 🔁 NEW: reset any previous training / tuning so we can train again cleanly
-        st["train_result"] = None
-        st["best_model_name"] = None
-        st["best_model_row"] = None
-
-        st["tuned_result"] = None
-        st["want_tune"] = False
-        st["tuning_stage"] = None
-        st["tuning_offered"] = False
-        st["chosen_tune_method"] = None
-        st["tune_metric"] = None
 
         # --- Infer task type if needed (classification vs regression) ---
         if not st.get("task_type"):
@@ -428,7 +415,7 @@ class ChatOrchestrator:
                 }
             )
 
-        return out   
+        return out
 
 
     # -------------------- QA helpers --------------------
@@ -682,11 +669,6 @@ class ChatOrchestrator:
                 "move forward with training", "move forward with the model training",
                 "proceed to training", "proceed to the training",
                 "proceed to train", "go for training",
-                "i want to train",
-                "i want to train again",
-                "i want to train my model",
-                "want to train",
-                "want to train again",
             ]
             if any(p in t for p in strong_phrases):
                 return True
@@ -695,7 +677,6 @@ class ChatOrchestrator:
             ):
                 return True
             return t in {"train", "training"}
-
 
         def wants_tune(t: str) -> bool:
             return any(w in t for w in ["tune", "tuning", "optimize", "improve model", "hyperparameter"])
@@ -765,21 +746,6 @@ class ChatOrchestrator:
                 )
                 st["stage"] = "preview_download"
                 st["show_only_preview"] = True
-                return st
-            
-            if wants_train(text):
-                st["tuning_stage"] = None
-                st["messages"].append(
-                    {
-                        "role": "assistant",
-                        "content": (
-                            "No problem — we’ll keep the current baseline model as it is.\n\n"
-                            "If you’d like to **train again with a different target column**, "
-                            "just tell me which column to use.\n\n"
-                            "For example: `Use price as my target` or `Target column is churn_flag`."
-                        ),
-                    }
-                )
                 return st
 
             # If the user asks for metrics/leaderboard instead of yes/no → QA
