@@ -80,8 +80,8 @@ if "chat_state" not in st.session_state:
     }
 
 orch = ChatOrchestrator()
-router = IntentRouter()
-planner = Planner()
+router = IntentRouter()  
+planner = Planner()       
 S = st.session_state["chat_state"]
 
 # ---------- Capture the ask-preprocess question to show AFTER preview ----------
@@ -120,7 +120,7 @@ def ui_missing():
     )
 
     st.caption("Add one or more column → strategy pairs.")
-    st.dataframe(miss_df, width="stretch")
+    st.dataframe(miss_df, use_container_width=True)
 
     allowed = ["mean", "median", "mode", "drop", "fill"]
     st.session_state.setdefault("ui_mv_rows", [])
@@ -183,7 +183,7 @@ def ui_duplicates():
     dup_count = int(len(df) - len(df.drop_duplicates()))
     st.caption("Number of duplicate rows detected in the current dataset.")
     st.dataframe(
-        pd.DataFrame([{"duplicate_rows": dup_count}]), width="stretch"
+        pd.DataFrame([{"duplicate_rows": dup_count}]), use_container_width=True
     )
     strategy = st.selectbox(
         "Duplicate strategy",
@@ -203,7 +203,7 @@ def ui_dtypes():
     st.caption("Select a column and the type to enforce. Add multiple if needed.")
     st.dataframe(
         pd.DataFrame({"column": df.columns, "dtype": df.dtypes.astype(str)}),
-        width="stretch",
+        use_container_width=True,
     )
 
     allowed = ["int", "float", "boolean", "timestamp", "string"]
@@ -582,7 +582,7 @@ def ui_train_inline():
     if S2.get("train_result") is None:
         cols_df = pd.DataFrame({"column": df_for_train.columns.tolist()})
         st.caption("Available columns in your dataset")
-        st.dataframe(cols_df, width="stretch")
+        st.dataframe(cols_df, use_container_width=True)
 
         st.info(
             "To start training, tell me **in the chat** which column is your target.\n\n"
@@ -602,7 +602,7 @@ def ui_train_inline():
     if S2.get("train_result") is not None:
         df = S2["train_result"]["results"]
         st.subheader("Leaderboard — Cross-Validation & Test Metrics")
-        st.dataframe(df, width="stretch")
+        st.dataframe(df, use_container_width=True)
 
         name, row = best_model_by_task(S2.get("task_type", "classification"), df)
         S2["best_model_name"] = name
@@ -663,7 +663,7 @@ def ui_train_inline():
 
         preds = S2["train_result"]["predictions"].get(name, {})
         with st.expander("Actual vs Predicted (first 20)"):
-            st.dataframe(pd.DataFrame(preds), width="stretch")
+            st.dataframe(pd.DataFrame(preds), use_container_width=True)
 
         st.download_button(
             "Download best_model.pkl",
@@ -731,7 +731,7 @@ def ui_preview_and_download():
     # --- Render on-demand preview ---
     df_preview = S2["pre_df"] if S2.get("pre_df") is not None else S2.get("clean_df")
     st.caption("Preview (first 15)")
-    st.dataframe(df_preview.head(15), width="stretch")
+    st.dataframe(df_preview.head(15), use_container_width=True)
 
     if S2.get("pre_df") is not None:
         st.download_button(
@@ -795,7 +795,7 @@ else:
     if S.get("stage") == "ask_preprocess" and S.get("clean_df") is not None:
         with st.chat_message("assistant"):
             with st.expander("Peek raw data (first 5)", expanded=True):
-                st.dataframe(S["clean_df"].head(5), width="stretch")
+                st.dataframe(S["clean_df"].head(5), use_container_width=True)
         if PENDING_ASK_PREPROC is not None:
             with st.chat_message("assistant"):
                 st.markdown(PENDING_ASK_PREPROC["content"])
@@ -825,7 +825,7 @@ else:
                     )
                     st.dataframe(
                         pd.DataFrame([{"duplicate_rows": dup_count}]),
-                        width="stretch",
+                        use_container_width=True,
                     )
                 with tabs[1]:
                     miss_df = pd.DataFrame(
@@ -837,13 +837,13 @@ else:
                             ).round(2),
                         }
                     ).sort_values("missing_count", ascending=False)
-                    st.dataframe(miss_df, width="stretch")
+                    st.dataframe(miss_df, use_container_width=True)
                 with tabs[2]:
                     st.dataframe(
                         pd.DataFrame(
                             {"column": df.columns, "dtype": df.dtypes.astype(str)}
                         ),
-                        width="stretch",
+                        use_container_width=True,
                     )
 
     if stage == "prep_missing":
