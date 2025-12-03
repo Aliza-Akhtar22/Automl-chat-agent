@@ -681,9 +681,8 @@ class ChatOrchestrator:
                 "train baselines", "train the model", "move to training",
                 "move forward with training", "move forward with the model training",
                 "proceed to training", "proceed to the training",
-                "proceed to train", "go for training",
-                "i want to train",
-                "i want to train again",
+                "proceed to train", "go for training", "i want to train",
+                "i want to train again", "my next target column"
                 "i want to train my model",
                 "want to train",
                 "want to train again",
