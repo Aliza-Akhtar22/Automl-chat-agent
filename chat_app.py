@@ -690,9 +690,9 @@ def ui_preview_and_download():
     Preview area.
     - Runs preprocessing once (via LangGraph) the first time we need a preview,
       showing a spinner while it runs.
-    - Shows preview ONLY when user explicitly asked (show_only_preview == True)
-      AND only before training. Never after training/tuning *unless*
-      show_training_panel is turned off.
+    - Shows preview ONLY when show_only_preview == True.
+    - When training/tuning results exist and we're in training mode, show ONLY
+      the training panel (no preview).
     """
     S2 = st.session_state["chat_state"]
 
@@ -710,10 +710,15 @@ def ui_preview_and_download():
     if S2.get("tuning_stage") in {"ask_consent", "choose_metric", "choose_method"}:
         return
 
-    # ❗ Only auto-show the training panel if we're explicitly in "training mode"
+    train_result = S2.get("train_result")
+    tuned_result = S2.get("tuned_result")
+
+    # 🔒 If we have training/tuning results and we're in "training mode",
+    # and we are NOT explicitly in preview-only mode, only show training UI.
     if (
-        (S2.get("train_result") is not None or S2.get("tuned_result") is not None)
+        (train_result is not None or tuned_result is not None)
         and S2.get("show_training_panel", False)
+        and not S2.get("show_only_preview", False)
     ):
         ui_train_inline()
         return
@@ -728,9 +733,10 @@ def ui_preview_and_download():
         st.session_state["chat_state"] = S2
         return
 
-    # 👉 Show preview ONLY if the user asked for it
+    # 👉 Only show preview when the flag is set (user explicitly asked)
     if not S2.get("show_only_preview", False):
-        # User didn't ask for preview: just show training UI (before training)
+        # Not in preview mode; if no training result yet, we can still show
+        # the training UI (column list + hint).
         ui_train_inline()
         return
 
@@ -754,7 +760,7 @@ def ui_preview_and_download():
             mime="text/csv",
         )
 
-    # 🔹 Planner-specific hint under the preview (now chat-based training)
+    # Planner-specific hint under the preview (now chat-based training)
     if S2.get("planner_active") and S2.get("train_result") is None:
         st.info(
             "Now kindly tell me **in the chat** which column should be used as the **target** "
@@ -779,9 +785,6 @@ def ui_preview_and_download():
             )
         else:
             ui_train_inline()
-
-
-
 
 # ---------- Upload gate ----------
 if S.get("raw_df") is None:

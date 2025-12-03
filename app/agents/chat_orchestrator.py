@@ -355,6 +355,8 @@ class ChatOrchestrator:
         st["chosen_tune_method"] = None
         st["tune_metric"] = None
         st["show_training_panel"] = True
+        st["show_only_preview"] = False
+        st["stage"] = "preview_download"
 
         # Also clear previous task_type so it's always re-inferred for the new target
         st["task_type"] = None
