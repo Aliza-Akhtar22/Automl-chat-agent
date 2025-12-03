@@ -302,7 +302,8 @@ class ChatOrchestrator:
 
         It will:
           - set st['target_col']
-          - infer the task_type if missing (classification vs regression)
+          - infer the task_type from the *current* target (classification vs regression)
+          - reset any previous training/tuning state
           - set the want_train/approved flags
           - call run_automl_graph (with a second pass if preprocessing just got created)
           - append a friendly assistant message about what happened
@@ -343,7 +344,7 @@ class ChatOrchestrator:
         # Persist the chosen target in state
         st["target_col"] = target_col
 
-        # 🔁 NEW: reset any previous training / tuning so we can train again cleanly
+        # 🔁 Reset ANY previous training / tuning so we can train again cleanly
         st["train_result"] = None
         st["best_model_name"] = None
         st["best_model_row"] = None
@@ -355,22 +356,26 @@ class ChatOrchestrator:
         st["chosen_tune_method"] = None
         st["tune_metric"] = None
 
-        # --- Infer task type if needed (classification vs regression) ---
-        if not st.get("task_type"):
-            try:
-                from app.agents.nodes import choose_task_type  # local import to avoid cycles
-                y = df[target_col]
-                task = choose_task_type(y)
-            except Exception:
-                y = df[target_col]
-                # Simple fallback: numeric → regression, else classification
-                if pd.api.types.is_numeric_dtype(y):
-                    task = "regression"
-                else:
-                    task = "classification"
-            st["task_type"] = task
-        else:
-            task = st["task_type"]
+        # Also clear previous task_type so it's always re-inferred for the new target
+        st["task_type"] = None
+
+        # --- Always infer task type from THIS target column (classification vs regression) ---
+        try:
+            from app.agents.nodes import choose_task_type  # local import to avoid cycles
+            y = df[target_col]
+            task = choose_task_type(y)
+        except Exception:
+            y = df[target_col]
+            # Slightly smarter fallback:
+            # - many distinct numeric values -> regression
+            # - few distinct values (like 0/1) -> classification
+            nunique = y.nunique(dropna=True)
+            if pd.api.types.is_numeric_dtype(y) and nunique > 10:
+                task = "regression"
+            else:
+                task = "classification"
+
+        st["task_type"] = task
 
         # Let the user know what we're doing
         st["messages"].append(
@@ -686,7 +691,7 @@ class ChatOrchestrator:
                 "i want to train again",
                 "i want to train my model",
                 "want to train",
-                "want to train again",
+                "want to train again", "my next target column",
             ]
             if any(p in t for p in strong_phrases):
                 return True
