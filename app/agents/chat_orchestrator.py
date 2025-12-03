@@ -769,6 +769,8 @@ class ChatOrchestrator:
             
             if wants_train(text):
                 st["tuning_stage"] = None
+                st["tuning_offered"] = False
+                st["want_tune"] = False
                 st["messages"].append(
                     {
                         "role": "assistant",
@@ -781,6 +783,15 @@ class ChatOrchestrator:
                     }
                 )
                 return st
+            new_target = self._parse_target_from_text(text_raw, st)
+            if new_target is not None:
+                # cancel tuning chat completely
+                st["tuning_stage"] = None
+                st["tuning_offered"] = False
+                st["want_tune"] = False
+                # run fresh baselines on the new target
+                out = self._run_baseline_training(st, new_target)
+                return out
 
             # If the user asks for metrics/leaderboard instead of yes/no → QA
             if self._looks_like_qa(text):
