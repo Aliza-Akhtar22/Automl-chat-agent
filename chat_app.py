@@ -77,6 +77,8 @@ if "chat_state" not in st.session_state:
         # Tuning conversational state
         "tuning_stage": None,
         "tuning_offered": False,
+        # ---- UI visibility flags ----
+        "show_training_panel": False,
     }
 
 orch = ChatOrchestrator()
@@ -689,7 +691,8 @@ def ui_preview_and_download():
     - Runs preprocessing once (via LangGraph) the first time we need a preview,
       showing a spinner while it runs.
     - Shows preview ONLY when user explicitly asked (show_only_preview == True)
-      AND only before training. Never after training/tuning.
+      AND only before training. Never after training/tuning *unless*
+      show_training_panel is turned off.
     """
     S2 = st.session_state["chat_state"]
 
@@ -707,8 +710,11 @@ def ui_preview_and_download():
     if S2.get("tuning_stage") in {"ask_consent", "choose_metric", "choose_method"}:
         return
 
-    # Never show preview after training or tuning has been produced
-    if S2.get("train_result") is not None or S2.get("tuned_result") is not None:
+    # ❗ Only auto-show the training panel if we're explicitly in "training mode"
+    if (
+        (S2.get("train_result") is not None or S2.get("tuned_result") is not None)
+        and S2.get("show_training_panel", False)
+    ):
         ui_train_inline()
         return
 

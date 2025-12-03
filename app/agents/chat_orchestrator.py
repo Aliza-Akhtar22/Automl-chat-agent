@@ -348,13 +348,13 @@ class ChatOrchestrator:
         st["train_result"] = None
         st["best_model_name"] = None
         st["best_model_row"] = None
-
         st["tuned_result"] = None
         st["want_tune"] = False
         st["tuning_stage"] = None
         st["tuning_offered"] = False
         st["chosen_tune_method"] = None
         st["tune_metric"] = None
+        st["show_training_panel"] = True
 
         # Also clear previous task_type so it's always re-inferred for the new target
         st["task_type"] = None
@@ -658,6 +658,7 @@ class ChatOrchestrator:
         """
         st = state.copy()
         st["last_bot"] = None
+        st.setdefault("show_training_panel", False)
 
         stage = st.get("stage", "await_upload")
         tuning_stage = st.get("tuning_stage")
@@ -969,6 +970,7 @@ class ChatOrchestrator:
             if wants_train(text):
                 st["stage"] = "preview_download"
                 st["show_only_preview"] = False
+                st["show_training_panel"] = True
                 st["messages"].append(
                     {
                         "role": "assistant",
@@ -989,6 +991,7 @@ class ChatOrchestrator:
                 st = self._auto_plan_preprocessing(st)
                 st["stage"] = "preview_download"
                 st["show_only_preview"] = True
+                st["show_training_panel"] = False
                 st["messages"].append(
                     {
                         "role": "assistant",
@@ -1006,6 +1009,7 @@ class ChatOrchestrator:
                 # still allow preview/training.
                 st["stage"] = "preview_download"
                 st["show_only_preview"] = True
+                st["show_training_panel"] = False
                 st["messages"].append(
                     {
                         "role": "assistant",
@@ -1025,6 +1029,7 @@ class ChatOrchestrator:
             if wants_train(text):
                 st["stage"] = "preview_download"
                 st["show_only_preview"] = False
+                st["show_training_panel"] = True
                 st["messages"].append(
                     {
                         "role": "assistant",
@@ -1060,6 +1065,7 @@ class ChatOrchestrator:
                 st = self._auto_plan_preprocessing(st)
                 st["stage"] = "preview_download"
                 st["show_only_preview"] = True
+                st["show_training_panel"] = False
                 st["messages"].append(
                     {
                         "role": "assistant",
