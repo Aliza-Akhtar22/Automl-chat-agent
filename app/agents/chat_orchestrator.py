@@ -270,6 +270,7 @@ class ChatOrchestrator:
             "use column",
             "i want to predict",
             "i want to forecast",
+            "is my target column",
         ]
         if not any(p in t for p in trigger_phrases):
             return None
