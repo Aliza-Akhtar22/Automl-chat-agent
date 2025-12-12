@@ -5,19 +5,22 @@ from typing import Dict, Any, List
 
 class IntentRouter:
     """
-    Lightweight intent router.
+    Classifies user messages into:
+      - "qa"            (questions, metric queries, status checks)
+      - "simple_action" (single-step workflow action)
+      - "multi_step"    (multi-step workflows: preprocess→train, clean→train→tune, etc.)
 
-    It classifies a user message into:
-      - kind: "qa" | "simple_action" | "multi_step"
-      - actions: list of high-level actions mentioned: ["preprocess", "train", "tune", "preview"]
-      - reason: short string explaining why
+    Option B (Safe Multi-Step):
+      * Status questions remain QA.
+      * Requests containing multiple actions become multi_step.
+      * Analytical / metric questions → QA.
+      * Single action commands → simple_action.
     """
 
     def __init__(self) -> None:
-        # Could later accept config, thresholds, toggles, etc.
         pass
 
-    # ------------------------ public API ------------------------
+    # ------------------------ PUBLIC API ------------------------
     def classify(self, text: str, state: Dict[str, Any]) -> Dict[str, Any]:
         t = (text or "").strip().lower()
 
@@ -25,115 +28,118 @@ class IntentRouter:
             return {
                 "kind": "simple_action",
                 "actions": [],
-                "reason": "Empty/blank message; defaulting to simple_action.",
+                "reason": "Blank message → simple_action",
             }
 
         looks_like_question = self._looks_like_question(t)
         actions = self._extract_actions(t)
 
-        # --- 1) Explicit status / "have we done X" questions → QA ---
-        # e.g. "have we done preprocessing and training?",
-        #      "is tuning done?", "have we trained the model?"
+        # ------------------------------------------------------------
+        # 1) STATUS QUESTIONS (MUST ALWAYS BE QA)
+        # ------------------------------------------------------------
+        # Ex: "have we trained?", "is preprocessing done?", "did we tune?"
         if self._is_status_question(t):
             return {
                 "kind": "qa",
                 "actions": actions,
-                "reason": "Status-style question about whether steps (preprocess/train/tune) have been done.",
+                "reason": "Status question (have we / did we / is X done?) → QA",
             }
 
-        # --- 2) Multi-step / end-to-end detection ---
-        if self._looks_like_multi_step(t, actions):
-            return {
-                "kind": "multi_step",
-                "actions": actions,
-                "reason": "Text mentions multiple workflow actions or end-to-end behavior.",
-            }
-
-        # --- 3) QA / analytical questions ---
+        # ------------------------------------------------------------
+        # 2) METRIC / ANALYSIS QUESTIONS → ALWAYS QA
+        # ------------------------------------------------------------
         if looks_like_question and self._mentions_analysis_concepts(t):
             return {
                 "kind": "qa",
                 "actions": actions,
-                "reason": "Looks like a question about metrics/status/results, not a navigation command.",
+                "reason": "Analytical/metric question → QA",
             }
 
-        # --- 4) Simple action (single tool / navigation) ---
+        # ------------------------------------------------------------
+        # 3) MULTI-STEP COMMANDS (REQUEST TO DO MULTIPLE ACTIONS)
+        # ------------------------------------------------------------
+        # Ex: "preprocess and train", "clean data then train", "clean, train & tune"
+        is_multi = self._looks_like_multi_step(t, actions)
+
+        if is_multi and not looks_like_question:
+            # Only classify as multi-step when it's a request, not a question.
+            return {
+                "kind": "multi_step",
+                "actions": actions,
+                "reason": "Multiple workflow actions detected → multi_step",
+            }
+
+        # ------------------------------------------------------------
+        # 4) SIMPLE ACTION: SINGLE EXPLICIT ACTION
+        # ------------------------------------------------------------
         if actions:
             return {
                 "kind": "simple_action",
                 "actions": actions,
-                "reason": "Contains a single clear workflow action (preview/train/tune/preprocess).",
+                "reason": "Single workflow action found → simple_action",
             }
 
-        # --- 5) Fallbacks ---
+        # ------------------------------------------------------------
+        # 5) NON-METRIC QUESTIONS → QA
+        # ------------------------------------------------------------
         if looks_like_question:
             return {
                 "kind": "qa",
                 "actions": [],
-                "reason": "Question-like text; treating as QA by default.",
+                "reason": "Generic question → QA",
             }
 
+        # ------------------------------------------------------------
+        # 6) DEFAULT → SIMPLE ACTION
+        # ------------------------------------------------------------
         return {
             "kind": "simple_action",
             "actions": [],
-            "reason": "No clear QA or multi-step pattern; treat as simple navigation or small talk.",
+            "reason": "No strong signals → simple_action",
         }
 
-    # ------------------------ helpers ------------------------
+    # ------------------------ HELPERS ------------------------
+
     def _looks_like_question(self, t: str) -> bool:
         if "?" in t:
             return True
         q_starts = (
             "what", "which", "how", "why", "when", "where",
-            "did", "do ", "does", "have", "has", "is ", "are ",
-            "was", "were", "can", "could", "should", "would",
+            "did", "do ", "does", "have", "has",
+            "is ", "are ", "was", "were",
+            "can", "could", "should", "would",
         )
         return any(t.startswith(p) for p in q_starts)
 
     def _is_status_question(self, t: str) -> bool:
         """
         Detect questions like:
-          - "have we done preprocessing and training?"
-          - "have we preprocessed the data?"
-          - "is tuning done?"
-        These should go straight to the QA helper instead of the multi-step planner.
+           - "have we done preprocessing?"
+           - "is training finished?"
+           - "did we tune the model?"
+        These MUST be QA (Option B rule)
         """
         status_starts = (
-            "have we",
-            "have i",
-            "did we",
-            "did i",
-            "has the",
-            "is ",
-            "are ",
-            "was ",
-            "were ",
+            "have we", "have i", "did we", "did i",
+            "has the", "is ", "are ", "was ", "were ",
         )
+
         status_keywords = [
-            "done",
-            "completed",
-            "finished",
-            "preprocess",
-            "preprocessed",
-            "preprocessing",
-            "cleaned",
-            "processed",
-            "training",
-            "trained",
-            "built",
-            "model",
-            "tuning",
-            "tuned",
-            "optimized",
-            "optimization",
+            "done", "completed", "finished",
+            "preprocess", "preprocessed", "preprocessing",
+            "cleaned", "processed",
+            "training", "trained",
+            "model", "tuning", "tuned",
+            "optimization", "optimized",
         ]
+
         return any(t.startswith(s) for s in status_starts) and any(
             k in t for k in status_keywords
         )
 
     def _mentions_analysis_concepts(self, t: str) -> bool:
         """
-        Metric / status / explanation style queries = QA.
+        Detect metric/explanation/status analytical queries → QA.
         """
         keywords = [
             "accuracy", "f1", "precision", "recall",
@@ -141,130 +147,84 @@ class IntentRouter:
             "score", "metric", "metrics",
             "leaderboard", "best model", "which model",
             "trained", "training done", "did training finish",
-            "preprocess", "preprocessing", "cleaning done",
+            "cleaning done", "preprocessed",
             "finished", "completed",
-            "why is", "why my", "why the", "negative", "bad result",
-            # NEW: explanation / results-oriented queries
+            "why is", "why my", "why the",
+            "negative", "bad result",
             "result", "results", "explain", "explanation",
         ]
         return any(k in t for k in keywords)
 
     def _extract_actions(self, t: str) -> List[str]:
         """
-        Map natural language phrases to high-level actions:
-          - "preview"   → preview
-          - "preprocess"→ preprocess
-          - "train"     → train
-          - "tune"      → tune
+        Detect high-level workflow intents.
         """
         actions: List[str] = []
 
-        # Preview
         preview_words = [
-            "preview",
-            "show preview",
-            "see preview",
-            "see the preview",
-            "show the preview",
-            "show data",
-            "see data",
-            "show the data",
-            "see the data",
-            "data preview",
-            "show table",
-            "see table",
+            "preview", "show preview", "see preview",
+            "show data", "see data", "data preview",
+            "show table", "see table",
         ]
         if any(w in t for w in preview_words):
             actions.append("preview")
 
-        # Preprocess / clean
         preprocess_words = [
-            "preprocess",
-            "pre-processing",
-            "clean data",
-            "clean the data",
-            "data cleaning",
-            "handle missing",
-            "handle duplicates",
-            "fix missing",
-            "fix nulls",
-            "drop duplicates",
+            "preprocess", "pre-processing", "clean data",
+            "clean the data", "data cleaning",
+            "handle missing", "fix missing",
+            "drop duplicates", "clean up",
         ]
         if any(w in t for w in preprocess_words):
             actions.append("preprocess")
 
-        # Train
         train_words = [
-            "train",
-            "training",
-            "train baselines",
-            "start training",
-            "run training",
-            "train the model",
-            "model training",
-            "go to training",
-            "move to training",
+            "train", "training", "train baselines",
+            "start training", "run training",
+            "train the model", "model training",
+            "go to training", "move to training",
         ]
         if any(w in t for w in train_words):
             actions.append("train")
 
-        # Tune
         tune_words = [
-            "tune",
-            "tuning",
-            "hyperparameter",
-            "hyper parameter",
-            "optimize model",
-            "optimize the model",
-            "improve model",
-            "improve the model",
-            "random search",
-            "bayesian optimization",
+            "tune", "tuning", "hyperparameter",
+            "optimize model", "improve model",
+            "random search", "bayesian optimization",
         ]
         if any(w in t for w in tune_words):
             actions.append("tune")
 
-        # De-duplicate while preserving order
+        # Deduplicate while preserving order
+        unique = []
         seen = set()
-        unique_actions: List[str] = []
         for a in actions:
             if a not in seen:
                 seen.add(a)
-                unique_actions.append(a)
-        return unique_actions
+                unique.append(a)
+        return unique
 
     def _looks_like_multi_step(self, t: str, actions: List[str]) -> bool:
         """
         Multi-step if:
-          - multiple distinct actions in the same sentence, OR
-          - explicit end-to-end phrases.
+           - The user *requests* multiple steps
+           - OR uses explicit end-to-end wording
         """
-        # Explicit end-to-end wording
-        if any(
-            phrase in t
-            for phrase in [
-                "end to end",
-                "end-to-end",
-                "full pipeline",
-                "full automl",
-                "run everything",
-                "do everything",
-                "do the whole thing",
-                "all steps",
-                "from preprocessing to training",
-                "from preprocess to train",
-                "clean data, train",
-                "clean, train",
-                "clean data and train",
-                "clean data then train",
-                "preprocess and then train",
-                "preprocess then train",
-            ]
-        ):
+        # Explicit multi-step phrases
+        explicit_phrases = [
+            "end to end", "end-to-end", "full pipeline",
+            "full automl", "run everything",
+            "do everything", "all steps",
+            "from preprocessing to training",
+            "from preprocess to train",
+            "clean data and train",
+            "clean data then train",
+            "preprocess and then train",
+            "preprocess then train",
+            "clean, train", "clean, train, tune",
+        ]
+        if any(p in t for p in explicit_phrases):
             return True
 
-        # Multiple workflow actions in same query
-        if len(actions) >= 2:
-            return True
-
-        return False
+        # Multiple workflow actions = multi-step
+        return len(actions) >= 2

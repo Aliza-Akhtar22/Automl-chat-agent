@@ -23,13 +23,37 @@ def get_openai_key() -> str:
 #  Task type detection
 # -----------------------------------------------------
 def detect_task_type(y: pd.Series) -> str:
+    """
+    Heuristic to decide whether the problem is classification or regression.
+
+    Rules:
+    - If y is non-numeric → classification
+    - If y is float numeric → regression (almost always continuous)
+    - If y is integer numeric:
+        * classification only when there are a small number of classes
+          that repeat many times
+        * otherwise → regression
+    """
+    # Non-numeric target → classification
     if not pd.api.types.is_numeric_dtype(y):
         return "classification"
-    nunq = y.nunique(dropna=True)
-    if nunq <= max(20, int(0.05 * len(y))):
-        return "classification"
-    return "regression"
 
+    nunq = y.nunique(dropna=True)
+    total = len(y)
+
+    # Float targets are almost always regression
+    if pd.api.types.is_float_dtype(y):
+        return "regression"
+
+    # Integer targets:
+    # treat as classification only if:
+    #  - very few distinct values (≤ 10)
+    #  - and they are not too sparse (≤ 10% of total samples)
+    if nunq <= 10 and nunq <= 0.1 * total:
+        return "classification"
+
+    # Otherwise, treat as regression
+    return "regression"
 
 # -----------------------------------------------------
 #  Safe train-test split with stratify fallback
@@ -110,7 +134,6 @@ def cross_val_metrics(model, X_train, y_train, task_type: str, folds: int = 5):
         return {"cv_score": None, "cv_std": None}
 
 
-
 # -----------------------------------------------------
 # Metrics utilities
 # -----------------------------------------------------
@@ -133,15 +156,50 @@ def regression_metrics(y_true, y_pred):
 
 
 # -----------------------------------------------------
-# Best model selection
+# Best model selection (robust to missing metrics)
 # -----------------------------------------------------
 def best_model_by_task(task_type: str, results: pd.DataFrame) -> Tuple[str, dict]:
+    """
+    Choose the best model row from a leaderboard DataFrame without assuming
+    that any specific metric column (like 'rmse') always exists.
+
+    For classification:
+        prefer f1 > accuracy > precision > recall (maximize).
+    For regression:
+        prefer r2 (max), then rmse (min), then mae (min), then mse (min).
+    If none of these are present or all-NaN, fall back to the first row.
+    """
+    if results is None or results.empty:
+        return "", {}
+
+    # default index if everything else fails
+    best_idx = 0
+
     if task_type == "classification":
-        idx = results["f1"].idxmax() if "f1" in results.columns else results["accuracy"].idxmax()
+        # larger is better
+        for metric in ["f1", "accuracy", "precision", "recall"]:
+            if metric in results.columns:
+                s = results[metric]
+                if s.notna().any():
+                    best_idx = s.idxmax()
+                    break
     else:
-        idx = results["r2"].idxmax() if "r2" in results.columns else results["rmse"].idxmin()
-    row = results.loc[idx].to_dict()
-    name = str(row.get("model"))
+        # regression: r2 larger is better; rmse/mae/mse smaller is better
+        metric_candidates = [
+            ("r2", True),
+            ("rmse", False),
+            ("mae", False),
+            ("mse", False),
+        ]
+        for metric, larger_is_better in metric_candidates:
+            if metric in results.columns:
+                s = results[metric]
+                if s.notna().any():
+                    best_idx = s.idxmax() if larger_is_better else s.idxmin()
+                    break
+
+    row = results.loc[best_idx].to_dict()
+    name = str(row.get("model", best_idx))
     return name, row
 
 
@@ -173,6 +231,7 @@ def inverse_transform_if_possible(arr, encoder):
 
 _CLASS_METRICS = {"f1", "accuracy", "precision", "recall"}
 _REG_METRICS = {"r2", "mae", "rmse"}
+
 
 def normalize_metric(metric: Optional[str]) -> Optional[str]:
     """

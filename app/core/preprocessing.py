@@ -1,3 +1,4 @@
+# preprocessing.py
 import numpy as np
 import pandas as pd
 from typing import Dict, List, Any, Tuple, Optional
@@ -16,6 +17,7 @@ logger = logging.getLogger(__name__)
 # --------------------------------
 _CANON_NULLS = {"?", "none", "nan", ""}
 
+
 def _coerce_single(x):
     if isinstance(x, str):
         sx = x.strip().lower()
@@ -23,17 +25,21 @@ def _coerce_single(x):
             return np.nan
     return x
 
+
 def coerce_nulls(df: pd.DataFrame) -> pd.DataFrame:
     """Convert '?', 'None', 'NaN', '' → np.nan across the whole frame."""
     return df.applymap(_coerce_single)
+
 
 def missing_report(df: pd.DataFrame) -> Dict[str, Any]:
     miss_by_col = df.isna().sum()
     all_nan_cols = miss_by_col[miss_by_col == len(df)].index.tolist()
     return {"missing_by_column": miss_by_col.to_dict(), "all_nan_columns": all_nan_cols}
 
+
 def drop_all_nan_cols(df: pd.DataFrame, cols_to_drop: List[str]) -> pd.DataFrame:
     return df.drop(columns=cols_to_drop, errors="ignore")
+
 
 def dtypes_dict(df: pd.DataFrame):
     return {c: str(t) for c, t in df.dtypes.to_dict().items()}
@@ -54,12 +60,14 @@ def convert_numpy_types(obj: Any) -> Any:
         return [convert_numpy_types(item) for item in obj]
     return obj
 
+
 def clean_column_name(col_name: str) -> str:
     col_name = col_name.lower().replace(' ', '_')
     col_name = re.sub(r'[^a-z0-9_]', '', col_name)
     if len(col_name) == 0 or not col_name[0].isalpha():
         col_name = 'col_' + col_name
     return col_name
+
 
 def handle_duplicates(df: pd.DataFrame, strategy: str = 'drop') -> Tuple[pd.DataFrame, Dict[str, Any]]:
     duplicate_stats = {'total_duplicates': 0, 'duplicate_columns': [], 'duplicate_indices': []}
@@ -79,6 +87,7 @@ def handle_duplicates(df: pd.DataFrame, strategy: str = 'drop') -> Tuple[pd.Data
         duplicate_stats['total_duplicates'] = int(df['is_duplicate'].sum())
         logger.info(f"Marked {duplicate_stats['total_duplicates']} duplicate rows")
     return df, duplicate_stats
+
 
 def handle_missing_values(df: pd.DataFrame, strategy: Dict[str, str] = None) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
@@ -121,6 +130,7 @@ def handle_missing_values(df: pd.DataFrame, strategy: Dict[str, str] = None) -> 
     logger.info(f"Handled {missing_stats['total_missing']} missing values")
     return df, missing_stats
 
+
 def validate_data_types(df: pd.DataFrame, expected_types: Dict[str, str] = None) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     validation_stats = {'type_errors': {}, 'converted_columns': []}
     expected_types = expected_types or {}
@@ -145,15 +155,21 @@ def validate_data_types(df: pd.DataFrame, expected_types: Dict[str, str] = None)
                 logger.warning(f"Error converting {col} to {expected_types[col]}: {str(e)}")
     return df, validation_stats
 
+
 def infer_column_type(series: pd.Series) -> Tuple[str, Dict[str, Any]]:
-    if pd.api.types.is_datetime64_any_dtype(series): return "timestamp", {}
-    if pd.api.types.is_integer_dtype(series): return "int", {}
-    if pd.api.types.is_float_dtype(series): return "float", {}
-    if pd.api.types.is_bool_dtype(series): return "boolean", {}
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return "timestamp", {}
+    if pd.api.types.is_integer_dtype(series):
+        return "int", {}
+    if pd.api.types.is_float_dtype(series):
+        return "float", {}
+    if pd.api.types.is_bool_dtype(series):
+        return "boolean", {}
     # categorical if <10% unique (safe heuristic)
     if len(series) > 0 and (series.nunique(dropna=True) / len(series) < 0.1):
         return "categorical", {"categories": pd.Series(series).dropna().unique().tolist()}
     return "string", {}
+
 
 def clean_data_value(value: Any, col_type: str) -> Any:
     if pd.isna(value):
@@ -181,6 +197,65 @@ def clean_data_value(value: Any, col_type: str) -> Any:
     except (ValueError, TypeError):
         return None
 
+
+# --------------------------------
+# NEW: encode non-numeric columns for ML
+# --------------------------------
+def encode_non_numeric(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    Fast encoding of non-numeric columns:
+      - Detects datetimes from first 20 rows (much faster)
+      - Uses pandas categorical encoding instead of sklearn LabelEncoder (vectorized)
+      - Falls back to hashing (vectorized)
+    """
+    out = df.copy()
+    stats = {"encoded": [], "datetime": [], "hashed": []}
+
+    non_num_cols = out.select_dtypes(exclude=[np.number]).columns
+
+    for col in non_num_cols:
+        s = out[col]
+
+        # 1. FAST datetime detection using small sample
+        sample = s.dropna().astype(str).head(20)
+        is_datetime = False
+        if len(sample) > 0:
+            try:
+                pd.to_datetime(sample, errors="raise")
+                is_datetime = True
+            except Exception:
+                is_datetime = False
+
+        if is_datetime:
+            # vectorized apply
+            try:
+                full_dt = pd.to_datetime(s, errors="coerce")
+                out[col] = full_dt.view("int64") // 10**9  # seconds since epoch (fast + numeric)
+                stats["datetime"].append(col)
+                continue
+            except Exception:
+                pass
+
+        # 2. FAST label encoding using pandas categorical codes
+        try:
+            out[col] = s.astype("category").cat.codes
+            stats["encoded"].append(col)
+            continue
+        except Exception:
+            pass
+
+        # 3. Vectorized hashing
+        try:
+            out[col] = s.astype(str).apply(lambda x: hash(x) % 10_000_000)
+            stats["hashed"].append(col)
+        except Exception:
+            # fallback: set zeros (should never happen)
+            out[col] = 0
+            stats["hashed"].append(col)
+
+    return out, stats
+
+
 def process_dataframe(
     df: pd.DataFrame,
     column_mapping: Optional[Dict[str, str]] = None,
@@ -198,12 +273,15 @@ def process_dataframe(
       5) Handle missing values (per-column strategies allowed)
       6) Infer types + clean cell values
       7) (Optional) Enforce expected types via validate_data_types
+      8) Encode any remaining non-numeric columns to numeric for ML models
+
     Returns: df, inferred_col_types, type_params, processing_stats
     """
     processing_stats = {
         'duplicates': {},
         'missing_values': {},
         'type_validation': {},
+        'encoding': {},
         'original_shape': df.shape,
         'final_shape': None
     }
@@ -245,9 +323,14 @@ def process_dataframe(
     df, validation_stats = validate_data_types(df, col_types)
     processing_stats['type_validation'] = validation_stats
 
+    # Step 8: encode non-numeric columns so ML models always get numeric input
+    df, encoding_stats = encode_non_numeric(df)
+    processing_stats['encoding'] = encoding_stats
+
     processing_stats['final_shape'] = df.shape
     processing_stats = convert_numpy_types(processing_stats)
     return df, col_types, type_params, processing_stats
+
 
 def generate_column_mapping(df: pd.DataFrame, target_columns: Optional[List[str]] = None) -> Dict[str, str]:
     if not target_columns:

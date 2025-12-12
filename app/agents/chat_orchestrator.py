@@ -1,6 +1,7 @@
 # app/agents/chat_orchestrator.py
 from __future__ import annotations
 from typing import Dict, Any, List, Optional, Tuple
+import pickle
 import json
 
 import pandas as pd
@@ -12,11 +13,15 @@ from app.agents.prompts import (
     SYSTEM_DATA_SUMMARY,
     SYSTEM_QA_AGENT,
     SYSTEM_PREPROCESS_PLANNER,  # NEW: planner prompt
+    SYSTEM_EXPLAINER,           # 👈 add this
+    explanation_prompt,
 )
 from app.core.preprocessing import coerce_nulls, missing_report, dtypes_dict
-from app.core.utils import best_model_by_task
+from app.core.utils import best_model_by_task, detect_task_type
 from app.agents.runner import run_automl_graph
 
+from app.agents.intent_router import IntentRouter
+from app.agents.planner import Planner
 
 
 
@@ -24,7 +29,8 @@ from app.agents.runner import run_automl_graph
 
 class ChatOrchestrator:
     def __init__(self) -> None:
-        pass
+        self.intent_router = IntentRouter()
+        self.planner = Planner()
 
     # -------------------- Public: entry after upload --------------------
     def start_after_upload(self, df: pd.DataFrame, state: Dict[str, Any]) -> Dict[str, Any]:
@@ -98,6 +104,7 @@ class ChatOrchestrator:
         st["supervisor_reason"] = ""
 
         st["last_bot"] = None
+        st.setdefault("target_task_types", {})
         return st
 
     # -------------------- Hyperparameter tuning helpers --------------------
@@ -220,6 +227,8 @@ class ChatOrchestrator:
           - "my target is churn"
           - "use age as my label"
           - "set target to income"
+          - "select income as my target column"
+          - "as my target"
           - and also just the bare column name, e.g. "loan_status"
         """
         
@@ -302,7 +311,8 @@ class ChatOrchestrator:
 
         It will:
           - set st['target_col']
-          - infer the task_type from the *current* target (classification vs regression)
+          - infer the task_type from the *current* target (classification vs regression),
+            but remember that decision per-column so it never flips later.
           - reset any previous training/tuning state
           - set the want_train/approved flags
           - call run_automl_graph (with a second pass if preprocessing just got created)
@@ -344,7 +354,7 @@ class ChatOrchestrator:
         # Persist the chosen target in state
         st["target_col"] = target_col
 
-        # 🔁 Reset ANY previous training / tuning so we can train again cleanly
+        # Reset ANY previous training / tuning so we can train again cleanly
         st["train_result"] = None
         st["best_model_name"] = None
         st["best_model_row"] = None
@@ -358,24 +368,32 @@ class ChatOrchestrator:
         st["show_only_preview"] = False
         st["stage"] = "preview_download"
 
-        # Also clear previous task_type so it's always re-inferred for the new target
-        st["task_type"] = None
+        # We keep a per-column memory of the task type
+        target_task_types = st.get("target_task_types") or {}
+        remembered_task = target_task_types.get(target_col)
 
-        # --- Always infer task type from THIS target column (classification vs regression) ---
-        try:
-            from app.agents.nodes import choose_task_type  # local import to avoid cycles
-            y = df[target_col]
-            task = choose_task_type(y)
-        except Exception:
-            y = df[target_col]
-            # Slightly smarter fallback:
-            # - many distinct numeric values -> regression
-            # - few distinct values (like 0/1) -> classification
-            nunique = y.nunique(dropna=True)
-            if pd.api.types.is_numeric_dtype(y) and nunique > 10:
-                task = "regression"
-            else:
-                task = "classification"
+        # --- Infer task type ONLY if we don't have a remembered one yet ---
+        if remembered_task in {"classification", "regression"}:
+            task = remembered_task
+        else:
+            try:
+                from app.agents.nodes import choose_task_type  # local import to avoid cycles
+                y = df[target_col]
+                task = choose_task_type(y)
+            except Exception:
+                y = df[target_col]
+                # Slightly smarter fallback:
+                # - many distinct numeric values -> regression
+                # - few distinct values (like 0/1) -> classification
+                nunique = y.nunique(dropna=True)
+                if pd.api.types.is_numeric_dtype(y) and nunique > 10:
+                    task = "regression"
+                else:
+                    task = "classification"
+
+            # Remember this decision for this column so it never flips later
+            target_task_types[target_col] = task
+            st["target_task_types"] = target_task_types
 
         st["task_type"] = task
 
@@ -412,6 +430,23 @@ class ChatOrchestrator:
         if tr is not None and isinstance(tr.get("results"), pd.DataFrame):
             df_res = tr["results"]
             n_models = len(df_res)
+
+            # ------------------------------
+            # Save best model for download
+            # ------------------------------
+            best_model_name = out.get("best_model_name")
+
+            # Fallback (rare): if tool didn't set name, try to pick from results safely
+            if not best_model_name and not df_res.empty:
+                try:
+                    best_model_name = df_res.iloc[0]["model"]
+                    out["best_model_name"] = best_model_name
+                except Exception:
+                    best_model_name = None
+
+            best_model = tr.get("fitted", {}).get(best_model_name) if best_model_name else None
+            out["best_model_bytes"] = pickle.dumps(best_model) if best_model is not None else None
+
             out["messages"].append(
                 {
                     "role": "assistant",
@@ -419,7 +454,8 @@ class ChatOrchestrator:
                         f"✅ Done! I trained **{n_models} baseline model(s)** using **{target_col}** as the target.\n\n"
                         "You can see the **leaderboard** and download the **best model** in the panel below.\n\n"
                         "Feel free to ask me about the metrics (accuracy, F1, R², etc.) "
-                        "or say **tune the model** if you’d like to try hyperparameter tuning."
+                        "or say **tune the model** if you’d like to try hyperparameter tuning.\n\n"
+                        "__show_training_results__"
                     ),
                 }
             )
@@ -435,7 +471,22 @@ class ChatOrchestrator:
                 }
             )
 
-        return out   
+        if out.get("train_result"):
+            has_marker = any(
+                isinstance(m.get("content"), str) and "__show_training_results__" in m["content"]
+                for m in out.get("messages", [])
+                if m.get("role") == "assistant"
+                )
+        if not has_marker:
+            out.setdefault("messages", []).append(
+                {
+                    "role": "assistant",
+                    "content": "__show_training_results__",
+                }
+            )
+
+        return out
+
 
 
     # -------------------- QA helpers --------------------
@@ -504,6 +555,71 @@ class ChatOrchestrator:
             "done_rename": st.get("done_rename"),
         }
         return snapshot
+    
+    
+    def build_training_explanation(self, state: Dict[str, Any]) -> Optional[str]:
+        """
+        Use the LLM explainer prompt to generate a short, plain-English
+        explanation of the training results and why the best model is recommended.
+        """
+        st = state.copy()
+        tr = st.get("train_result") or {}
+        df = tr.get("results")
+
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return None
+
+        # Pick best model using the same helper as the QA snapshot
+        task = st.get("task_type", "classification")
+        best_name, best_row = best_model_by_task(task, df)
+        st["best_model_name"] = best_name
+        st["best_model_row"] = best_row
+
+        # Dataset size (rows/cols)
+        pre_df = st.get("pre_df")
+        clean_df = st.get("clean_df")
+        df_data = pre_df if isinstance(pre_df, pd.DataFrame) else clean_df
+
+        if isinstance(df_data, pd.DataFrame):
+            n_rows, n_cols = df_data.shape
+        else:
+            Xtr = tr.get("X_train")
+            Xte = tr.get("X_test")
+            n_rows = (len(Xtr) if Xtr is not None else 0) + (
+                len(Xte) if Xte is not None else 0
+            )
+            n_cols = len(df.columns)
+
+        # Collect the key metrics for the best model
+        metric_parts = []
+        for key in ["accuracy", "f1", "precision", "recall", "r2", "rmse", "mae"]:
+            if key in best_row and pd.notnull(best_row[key]):
+                metric_parts.append(f"{key}≈{float(best_row[key]):.3f}")
+        metrics_text = ", ".join(metric_parts)
+
+        summary = (
+            f"Task type: {task}. Dataset has about {n_rows} rows and {n_cols} columns.\n"
+            f"Best model on the leaderboard is {best_name} with {metrics_text}."
+        )
+
+        recommendation = (
+            f"I recommend {best_name} as the default model for this dataset."
+        )
+
+        try:
+            return chat_once(
+                system=SYSTEM_EXPLAINER,
+                user=explanation_prompt(summary, recommendation),
+                model="gpt-4o-mini",
+                temperature=0.25,
+            )
+        except Exception:
+            # Safe fallback if LLM call fails
+            return (
+                f"The best model is {best_name} with metrics: {metrics_text}. "
+                "It offers a good trade-off between performance and robustness on this dataset."
+            )
+
 
 
     def _qa_answer(self, user_text: str, st: Dict[str, Any]) -> str:
@@ -667,6 +783,25 @@ class ChatOrchestrator:
         text_raw = (user_text or "").strip()
         text = text_raw.lower()
 
+    # -------------------------------------------------------------
+    #  INTENT ROUTER SHOULD ONLY RUN AFTER UPLOAD IS COMPLETE
+    # -------------------------------------------------------------
+        router_active = (
+            text_raw != "" and                    # ignore blank messages
+            stage in {"ask_preprocess", "preview_download"}  # only after upload flow
+            )
+
+        if router_active:
+            intent = self.intent_router.classify(user_text, st)
+
+        # Multi-step → Planner handles everything (shows plan first)
+            if intent.get("kind") == "multi_step":
+                return self.planner.handle_multi_step(user_text, st, intent)
+
+        # Tool-level intent → directly invoke the appropriate tool via planner
+            if intent.get("kind") == "tool":
+                return self.planner.handle_tool(user_text, st, intent)
+
         def wants_preview(t: str) -> bool:
             preview_words = [
                 "preview", "show preview", "see preview", "download",
@@ -690,10 +825,10 @@ class ChatOrchestrator:
                 "move forward with training", "move forward with the model training",
                 "proceed to training", "proceed to the training",
                 "proceed to train", "go for training",
-                "i want to train",
+                "i want to train", "I want to train", "now train",
                 "i want to train again",
                 "i want to train my model",
-                "want to train",
+                "want to train", "now train for me",
                 "want to train again", "my next target column",
             ]
             if any(p in t for p in strong_phrases):
@@ -1001,7 +1136,8 @@ class ChatOrchestrator:
                             "Great, I’ll **automatically clean the data** for you now — "
                             "dropping duplicate rows, removing any all-NaN columns, and "
                             "choosing sensible strategies for missing values.\n\n"
-                            "Once that’s done, you’ll see a **preprocessed preview** below."
+                            "Once that’s done, you’ll see a **preprocessed preview** below.\n\n"
+                            "__show_preprocessed_preview__"
                         ),
                     }
                 )
@@ -1055,8 +1191,7 @@ class ChatOrchestrator:
                         "role": "assistant",
                         "content": (
                             "Here’s the **data preview** and a **download option** below.\n\n"
-                            "After checking it, you can proceed to **training** by telling me "
-                            "which column to use as the target, or ask me more questions."
+                            "__show_preprocessed_preview__"
                         ),
                     }
                 )
