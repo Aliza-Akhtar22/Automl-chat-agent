@@ -22,7 +22,7 @@ from app.agents.runner import run_automl_graph
 
 from app.agents.intent_router import IntentRouter
 from app.agents.planner import Planner
-
+from app.agents.intent_normalizer import IntentNormalizer
 
 
 
@@ -31,6 +31,7 @@ class ChatOrchestrator:
     def __init__(self) -> None:
         self.intent_router = IntentRouter()
         self.planner = Planner()
+        self.intent_normalizer = IntentNormalizer()
 
     # -------------------- Public: entry after upload --------------------
     def start_after_upload(self, df: pd.DataFrame, state: Dict[str, Any]) -> Dict[str, Any]:
@@ -65,11 +66,16 @@ class ChatOrchestrator:
                 "role": "assistant",
                 "content": (
                     f"{para}\n\n"
-                    "Would you like to proceed with **preprocessing** now? (yes / no)"
+                    "This is a **quick preview of the first 5 rows** of your dataset so you can verify that it loaded correctly.\n\n"
+                    "What would you like to do next?\n"
+                    "• Explore or preview the data\n"
+                    "• Clean / preprocess the data\n"
+                    "• Build a machine learning model\n\n"
+                    "Just tell me what you’d like to do."
                 ),
             }
         )
-        st["stage"] = "ask_preprocess"
+        st["stage"] = "post_upload_orientation"
 
         # User-config buckets (the wizard fills these incrementally)
         st.setdefault("pp_missing_strategy", {})      # col -> mean/median/mode/drop/fill
@@ -757,500 +763,131 @@ class ChatOrchestrator:
         st["want_preprocess"] = True
 
         return st
+    
+    def advance_plan(self, st: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Execute exactly ONE step from the approved plan.
+        """
+        st.setdefault("messages", [])
+        steps = st.get("plan_steps", [])
+        cursor = st.get("plan_cursor", 0)
 
-    # -------------------- Router for user free text --------------------
+        if cursor >= len(steps):
+            st["stage"] = "idle"
+            st["messages"].append(
+                {"role": "assistant", "content": "✅ Plan completed."}
+            )
+            return st
+
+        step = steps[cursor]
+
+        if step == "preprocess":
+            st["want_preprocess"] = True
+
+        elif step == "confirm_target":
+            st["stage"] = "await_target"
+            st["messages"].append(
+                {
+                    "role": "assistant",
+                    "content": "Which column should be used as the target?",
+                }
+            )
+            return st  # pause plan here
+
+        elif step == "train":
+            st["want_train"] = True
+
+        elif step == "tune":
+            st["want_tune"] = True
+
+        elif step == "preview":
+            st["show_only_preview"] = True
+
+        st["plan_cursor"] = cursor + 1
+        return st
+
     def handle(self, user_text: str, state: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Conversation brain:
-        - Decodes user intent.
-        - Sets high-level flags / stage.
-        - Tuning is handled via the graph once the metric is known.
-        - Preprocessing for non-technical users is automatic:
-            * Saying "yes" at the preprocess question runs an internal plan
-              (duplicates drop, all-NaN dropped, missing handled) and then
-              shows a preprocessed preview.
-        - If the message looks like a *question*, route to the QA helper instead
-          of just saying "use the controls above".
-        - Training is now fully chat-driven: user tells the target column in text,
-          and the orchestrator runs baselines automatically.
+        Production-ready conversation brain.
+
+        Flow:
+        user → intent_router → intent_normalizer → planner → approval → execution
+
+        Golden rule:
+        ANY state-changing request must be planned first.
         """
+
         st = state.copy()
-        st["last_bot"] = None
-        st.setdefault("show_training_panel", False)
+        st.setdefault("messages", [])
+        st.setdefault("stage", "await_upload")
+        st.setdefault("require_approval", False)
+        st.setdefault("approved", False)
+        st.setdefault("history", [])
+        st.setdefault("errors", [])
 
-        stage = st.get("stage", "await_upload")
-        tuning_stage = st.get("tuning_stage")
         text_raw = (user_text or "").strip()
-        text = text_raw.lower()
-
-    # -------------------------------------------------------------
-    #  INTENT ROUTER SHOULD ONLY RUN AFTER UPLOAD IS COMPLETE
-    # -------------------------------------------------------------
-        router_active = (
-            text_raw != "" and                    # ignore blank messages
-            stage in {"ask_preprocess", "preview_download"}  # only after upload flow
-            )
-
-        if router_active:
-            intent = self.intent_router.classify(user_text, st)
-
-        # Multi-step → Planner handles everything (shows plan first)
-            if intent.get("kind") == "multi_step":
-                return self.planner.handle_multi_step(user_text, st, intent)
-
-        # Tool-level intent → directly invoke the appropriate tool via planner
-            if intent.get("kind") == "tool":
-                return self.planner.handle_tool(user_text, st, intent)
-
-        def wants_preview(t: str) -> bool:
-            preview_words = [
-                "preview", "show preview", "see preview", "download",
-                "show data", "see data", "show table"
-            ]
-            return any(w in t for w in preview_words)
-
-        def wants_continue(t: str) -> bool:
-            continue_words = [
-                "continue", "next", "keep going", "proceed",
-                "go on", "carry on"
-            ]
-            return any(w in t for w in continue_words)
-
-        def wants_train(t: str) -> bool:
-            strong_phrases = [
-                "go to training", "go to the training", "go to the training part",
-                "training part", "model training", "start training",
-                "start the training", "run training", "run the training",
-                "train baselines", "train the model", "move to training",
-                "move forward with training", "move forward with the model training",
-                "proceed to training", "proceed to the training",
-                "proceed to train", "go for training",
-                "i want to train", "I want to train", "now train",
-                "i want to train again",
-                "i want to train my model",
-                "want to train", "now train for me",
-                "want to train again", "my next target column",
-            ]
-            if any(p in t for p in strong_phrases):
-                return True
-            if ("train" in t or "training" in t) and any(
-                v in t for v in ["go", "start", "run", "move", "proceed", "forward", "jump"]
-            ):
-                return True
-            return t in {"train", "training"}
-
-
-        def wants_tune(t: str) -> bool:
-            return any(w in t for w in ["tune", "tuning", "optimize", "improve model", "hyperparameter"])
-
-        # -------- GLOBAL handling of direct "tune" requests --------
-        # User can say "tune the model" / "go to tuning part" at ANY time.
-        if wants_tune(text) and tuning_stage is None:
-            # 1) If training has NOT been done yet -> explain that training is required first.
-            if not st.get("train_result"):
-                st["messages"].append(
-                    {
-                        "role": "assistant",
-                        "content": (
-                            "Hyperparameter tuning comes **after training**.\n\n"
-                            "First, please **tell me which column should be used as the target**.\n"
-                            "For example: `Use loan_status as my target`.\n\n"
-                            "I’ll detect whether it’s a classification or regression problem and "
-                            "run the **Train baselines** step for you. Once training finishes, "
-                            "you can say **tune the model** again and I’ll start the tuning process."
-                        ),
-                    }
-                )
-                return st
-
-            # 2) Training is done -> jump directly into the tuning conversation
-            task = st.get("task_type", "classification")
-            suggested = "f1" if task == "classification" else "r2"
-
-            # Recommend a method + short explanation
-            method, reason = self._recommend_tuning(st)
-            methods_brief = self._tuning_methods_brief()
-            st["chosen_tune_method"] = method
-            st["tuning_stage"] = "choose_metric"
-            human_label = "Bayesian optimization" if method == "bayesian" else "Random search"
-
-            st["messages"].append(
-                {
-                    "role": "assistant",
-                    "content": (
-                        "Great, we can proceed with **hyperparameter tuning**.\n\n"
-                        f"Here’s a quick comparison of tuning methods:\n\n{methods_brief}\n\n"
-                        f"For your situation, I’d recommend **{human_label}** — {reason}\n\n"
-                        f"I’ll use safe defaults and **{human_label}**.\n\n"
-                        f"Which **metric** should I optimize? (e.g., **{suggested}**)\n"
-                        "- Classification: `f1`, `accuracy`, `precision`, `recall`\n"
-                        "- Regression: `r2`, `rmse`, `mae`\n\n"
-                        "_You can also say **random search** if you prefer that method._"
-                    ),
-                }
-            )
+        if not text_raw:
             return st
 
-        # -------------------- TUNING: consent → metric → auto-run --------------------
-        if tuning_stage == "ask_consent":
-            # Allow user to jump back to preprocess even while tuning question is visible
-            if "preprocess" in text or "pre-processing" in text:
-                st["tuning_stage"] = None
-                st["messages"].append(
-                    {
-                        "role": "assistant",
-                        "content": (
-                            "Sure 👍 we can go back to **preprocessing**.\n"
-                            "I’ll keep handling the cleaning automatically in the background; "
-                            "you can still retrain the baselines when you’re ready."
-                        ),
-                    }
-                )
-                st["stage"] = "preview_download"
-                st["show_only_preview"] = True
-                return st
-            
-            if wants_train(text):
-                st["tuning_stage"] = None
-                st["tuning_offered"] = False
-                st["want_tune"] = False
-                st["messages"].append(
-                    {
-                        "role": "assistant",
-                        "content": (
-                            "No problem — we’ll keep the current baseline model as it is.\n\n"
-                            "If you’d like to **train again with a different target column**, "
-                            "just tell me which column to use.\n\n"
-                            "For example: `Use price as my target` or `Target column is churn_flag`."
-                        ),
-                    }
-                )
-                return st
-            new_target = self._parse_target_from_text(text_raw, st)
-            if new_target is not None:
-                # cancel tuning chat completely
-                st["tuning_stage"] = None
-                st["tuning_offered"] = False
-                st["want_tune"] = False
-                # run fresh baselines on the new target
-                out = self._run_baseline_training(st, new_target)
-                return out
+        # ---------------- Approval gate ----------------
+        if st.get("stage") == "plan_proposed":
+            return self.planner.handle_confirmation(text_raw, st)
+        
+        if st.get("stage") == "executing_plan":
+            st = self.advance_plan(st)
 
-            # If the user asks for metrics/leaderboard instead of yes/no → QA
-            if self._looks_like_qa(text):
-                answer = self._qa_answer(user_text, st)
-                st["messages"].append({"role": "assistant", "content": answer})
-                st["suppress_preview_once"] = True
-                return st
+            # Run graph ONLY if something was scheduled
+            if st.get("want_preprocess") or st.get("want_train") or st.get("want_tune"):
+                return run_automl_graph(st)
 
-            yes_words = {"yes", "y", "yeah", "yep", "ok", "okay", "sure"}
-            no_words = {"no", "n", "nope", "not now", "later"}
+            return st  # paused (e.g. waiting for target)
 
-            if text in no_words:
-                st["tuning_stage"] = None
-                st["messages"].append(
-                    {
-                        "role": "assistant",
-                        "content": "No worries 👍 We’ll keep the current baseline model. Say **tune the model** anytime.",
-                    }
-                )
-                return st
+        # Intent detection
+        raw_intent = self.intent_router.classify(text_raw, st)
 
-            if text in yes_words or wants_tune(text):
-                # Ask ONLY for the metric now
-                task = st.get("task_type", "classification")
-                suggested = "f1" if task == "classification" else "r2"
-                st["tuning_stage"] = "choose_metric"
-                # Brief explanation & recommendation between methods
-                method, reason = self._recommend_tuning(st)
-                methods_brief = self._tuning_methods_brief()
-                st["chosen_tune_method"] = method
-                human_label = "Bayesian optimization" if method == "bayesian" else "Random search"
+        # Intent normalization
+        safe_intent = self.intent_normalizer.normalize(
+            raw_intent=raw_intent,
+            state=st,
+            user_text=text_raw,
+        )
 
-                st["messages"].append(
-                    {
-                        "role": "assistant",
-                        "content": (
-                            f"Here’s a quick comparison of tuning methods:\n\n{methods_brief}\n\n"
-                            f"For your situation, I’d recommend **{human_label}** — {reason}\n\n"
-                            f"Great! I’ll use safe defaults and **{human_label}**.\n\n"
-                            f"Which **metric** should I optimize? (e.g., **{suggested}**)\n"
-                            "- Classification: `f1`, `accuracy`, `precision`, `recall`\n"
-                            "- Regression: `r2`, `rmse`, `mae`\n\n"
-                            "_You can also say **random search** if you prefer that method._"
-                        ),
-                    }
-                )
-                return st
+        kind = safe_intent.kind
+        actions = safe_intent.actions
 
-            # clarification
-            st["messages"].append(
-                {
-                    "role": "assistant",
-                    "content": "Please reply with **yes** to tune the model, or **no** to keep the baseline.",
-                }
-            )
-            return st
+        if kind == "confirm":
+            return self.planner.handle_confirmation(text_raw, st)
 
-        if tuning_stage == "choose_metric":
-            # Optional switch to random search if user mentions it here
-            if "random" in text:
-                st["chosen_tune_method"] = "random_search"
-            elif "bayes" in text or "bayesian" in text:
-                st["chosen_tune_method"] = "bayesian"
-
-            task = st.get("task_type", "classification")
-            metric = self._parse_metric(text, task)
-            if metric:
-                st["tune_metric"] = metric
-                # Defaults: method = bayesian if not explicitly changed
-                st["chosen_tune_method"] = st.get("chosen_tune_method") or "bayesian"
-
-                # Trigger tuning immediately via graph
-                st["want_tune"] = True
-                st["approved"] = True  # pass HITL gate automatically after chat consent
-                out = run_automl_graph(st)
-
-                if out.get("tuned_result"):
-                    # Success message + tiny summary
-                    tr = out["tuned_result"]
-                    best_params = tr.get("best_params", {})
-                    test_metrics = tr.get("test_metrics", {})
-                    method_label = (
-                        "Bayesian optimization" if out.get("chosen_tune_method") == "bayesian" else "Random search"
-                    )
-                    out["messages"].append(
-                        {
-                            "role": "assistant",
-                            "content": (
-                                f"✅ **Tuning complete** with **{method_label}** optimizing **{metric}**.\n\n"
-                                f"**Best params:** `{best_params}`\n\n"
-                                f"**Test metrics:** `{test_metrics}`\n\n"
-                                "You can now **download the best model** from the panel or ask me to explain the results."
-                            ),
-                        }
-                    )
-                else:
-                    out["messages"].append(
-                        {
-                            "role": "assistant",
-                            "content": (
-                                "I tried to run tuning, but it didn’t complete. "
-                                "Please check the **errors/history** panel above, or try again."
-                            ),
-                        }
-                    )
-
-                out["tuning_stage"] = None
-                return out
-
-            # If user didn’t provide a recognizable metric, re-ask with examples
-            st["messages"].append(
-                {
-                    "role": "assistant",
-                    "content": (
-                        "Please tell me **one metric** to optimize:\n"
-                        "- Classification: `f1`, `accuracy`, `precision`, or `recall`\n"
-                        "- Regression: `r2`, `rmse`, or `mae`\n"
-                        "You can also type **random search** to change the tuning method."
-                    ),
-                }
-            )
-            return st
-
-        # -------------------- Tuning method chooser (legacy support) --------------------
-        if tuning_stage == "choose_method":
-            chosen = None
-            if "bayes" in text or "bayesian" in text:
-                chosen = "bayesian"
-            elif "random" in text:
-                chosen = "random_search"
-
-            if chosen is not None:
-                st["chosen_tune_method"] = chosen
-                st["tuning_stage"] = "choose_metric"
-                task = st.get("task_type", "classification")
-                suggested = "f1" if task == "classification" else "r2"
-                st["messages"].append(
-                    {
-                        "role": "assistant",
-                        "content": (
-                            f"Great — we’ll use **{'Bayesian optimization' if chosen=='bayesian' else 'Random search'}**.\n\n"
-                            f"Which **metric** should I optimize? (e.g., **{suggested}**)"
-                        ),
-                    }
-                )
-                return st
-
-            if wants_tune(text):
-                brief = self._tuning_methods_brief()
-                st["messages"].append(
-                    {
-                        "role": "assistant",
-                        "content": f"Please pick one option.\n\n{brief}\nType **Bayesian optimization** or **Random search**.",
-                    }
-                )
-                return st
-
-        # -------------------- Global chat-based target selection + training --------------------
-        # If we’re not in the middle of a tuning conversation, allow the user
-        # to set the target column via chat and immediately run baselines.
-        if tuning_stage is None:
-            target_col = self._parse_target_from_text(text_raw, st)
-            if target_col is not None:
-                out = self._run_baseline_training(st, target_col)
-                return out
-
-        # -------------------- Preprocessing / navigation logic --------------------
-        if stage == "ask_preprocess":
-            # User wants to jump straight to training
-            if wants_train(text):
-                st["stage"] = "preview_download"
-                st["show_only_preview"] = False
-                st["show_training_panel"] = True
-                st["messages"].append(
-                    {
-                        "role": "assistant",
-                        "content": (
-                            "Got it 👍 we’ll move towards training.\n\n"
-                            "Below you’ll see a quick preview of your data and the **Train baselines** section.\n\n"
-                            "I’ll still handle basic cleaning automatically in the background.\n"
-                            "When you’re ready, just **tell me which column is the target** "
-                            "(for example: `Use loan_status as my target`) and I’ll train the baselines for you."
-                        ),
-                    }
-                )
-                return st
-
-            yes_words = {"yes", "y", "yeah", "yep", "ok", "okay", "sure"}
-            if text in yes_words:
-                # NEW: automatic preprocessing — no wizard / menu
-                st = self._auto_plan_preprocessing(st)
-                st["stage"] = "preview_download"
-                st["show_only_preview"] = True
-                st["show_training_panel"] = False
-                st["messages"].append(
-                    {
-                        "role": "assistant",
-                        "content": (
-                            "Great, I’ll **automatically clean the data** for you now — "
-                            "dropping duplicate rows, removing any all-NaN columns, and "
-                            "choosing sensible strategies for missing values.\n\n"
-                            "Once that’s done, you’ll see a **preprocessed preview** below.\n\n"
-                            "__show_preprocessed_preview__"
-                        ),
-                    }
-                )
-                return st
-            else:
-                # User said "no" or something else → skip explicit preprocessing,
-                # still allow preview/training.
-                st["stage"] = "preview_download"
-                st["show_only_preview"] = True
-                st["show_training_panel"] = False
-                st["messages"].append(
-                    {
-                        "role": "assistant",
-                        "content": (
-                            "Okay, we’ll skip any extra preprocessing for now.\n\n"
-                            "Here’s the **data preview** and a **download option** below.\n"
-                            "You can go **straight to training** whenever you’re ready by "
-                            "telling me which column should be the target."
-                        ),
-                    }
-                )
-                return st
-
-        # Main behaviour once we are past the initial question: only preview / training / tuning
-        if stage == "preview_download":
-            # User wants training (but hasn’t directly specified a target in this message)
-            if wants_train(text):
-                st["stage"] = "preview_download"
-                st["show_only_preview"] = False
-                st["show_training_panel"] = True
-                st["messages"].append(
-                    {
-                        "role": "assistant",
-                        "content": (
-                            "Sure ✅ jumping ahead.\n\n"
-                            "Below you’ll see the data preview and the **Train baselines** section.\n\n"
-                            "Please **tell me which column is your target** in the chat, "
-                            "for example: `Use price as my target`. I’ll detect the task type "
-                            "and run the baseline models for you."
-                        ),
-                    }
-                )
-                return st
-
-            # User explicitly asks for preview again
-            if wants_preview(text):
-                st["stage"] = "preview_download"
-                st["show_only_preview"] = True
-                st["messages"].append(
-                    {
-                        "role": "assistant",
-                        "content": (
-                            "Here’s the **data preview** and a **download option** below.\n\n"
-                            "__show_preprocessed_preview__"
-                        ),
-                    }
-                )
-                return st
-
-            # If user types "preprocess" later, just re-run automatic plan + preview
-            if "preprocess" in text or "pre-processing" in text:
-                st = self._auto_plan_preprocessing(st)
-                st["stage"] = "preview_download"
-                st["show_only_preview"] = True
-                st["show_training_panel"] = False
-                st["messages"].append(
-                    {
-                        "role": "assistant",
-                        "content": (
-                            "I’ve refreshed the **automatic preprocessing** for you and updated "
-                            "the **preprocessed preview** below."
-                        ),
-                    }
-                )
-                return st
-
-            # Generic "continue" → gentle nudge towards training
-            if wants_continue(text) or text in {"yes", "y"}:
-                st["stage"] = "preview_download"
-                st["show_only_preview"] = False
-                st["messages"].append(
-                    {
-                        "role": "assistant",
-                        "content": (
-                            "Let’s keep going 🚀\n"
-                            "You can now **tell me in the chat which column is the target**, "
-                            "and I’ll run **Train baselines** for you."
-                        ),
-                    }
-                )
-                return st
-
-        # -------------------- QA fallback for workflow questions --------------------
-        if self._looks_like_qa(text):
-            answer = self._qa_answer(user_text, st)
+        # QA is allowed immediately
+        if kind == "qa":
+            answer = self._qa_answer(text_raw, st)
             st["messages"].append({"role": "assistant", "content": answer})
-            # Let the UI know not to auto-show preview in response to pure Q&A
-            st["suppress_preview_once"] = True
             return st
 
-        # Generic fallback hint (non-question, non-action)
+        # EVERYTHING ELSE → PLAN FIRST
+        if kind == "plan":
+            intent_payload = {
+                "kind": kind,
+                "actions": actions,
+                "reason": safe_intent.reason,
+            }
+            return self.planner.handle_multi_step(
+                user_text=text_raw,
+                state=st,
+                intent=intent_payload,
+            )
+
+        # Safe fallback
         st["messages"].append(
             {
                 "role": "assistant",
                 "content": (
-                    "You can **preview the data**, **start training** by telling me your target column, "
-                    "ask me to **tune the model**, or just ask a question about what’s been done so far."
+                    "I can help you clean the data, train a model, tune it, "
+                    "or explain what’s been done so far."
                 ),
             }
         )
         return st
-
-
 
     # -------------------- Helper messages --------------------
     def _menu_message(self, st: Dict[str, Any]) -> str:
