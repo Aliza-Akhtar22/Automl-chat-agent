@@ -39,6 +39,7 @@ from app.core.utils import (
     metric_to_sklearn_scorer,
     validate_metric_for_task,
 )
+from app.core.forecasting import run_prophet_forecast as _run_prophet_forecast
 
 
 # --------- helpers ---------
@@ -400,5 +401,94 @@ def tune_best_model_random_search_tool(state: Dict[str, Any]) -> Dict[str, Any]:
         st["history"].append(
             {"tool": "tune_best_model_random_search", "status": "failed"}
         )
+
+    return st
+
+@tool("forecast_with_prophet", return_direct=False)
+def forecast_with_prophet_tool(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Run Prophet forecast.
+
+    Uses:
+      - pre_df if available else clean_df
+      - ds_col (datetime)
+      - y_col (numeric)
+      - forecast_periods (default 30)
+      - forecast_freq (optional)
+
+    Populates:
+      - forecast_result: dict with forecast_df + metadata
+      - forecast_preview: first 15 rows in user-friendly columns
+    """
+    st = _copy(state)
+    _ensure_lists(st)
+
+    df = _get_df_for_model(st)
+    if df is None:
+        st["errors"].append("forecast_with_prophet: missing dataframe (pre_df/clean_df).")
+        st["history"].append({"tool": "forecast_with_prophet", "status": "failed"})
+        return st
+
+    ds_col = st.get("ds_col")
+    y_col = st.get("y_col")
+    if not ds_col or not y_col:
+        st["errors"].append("forecast_with_prophet: requires ds_col and y_col.")
+        st["history"].append({"tool": "forecast_with_prophet", "status": "failed"})
+        return st
+
+    periods = int(st.get("forecast_periods", 30))
+    freq = st.get("forecast_freq")  # may be None
+
+    try:
+        res = _run_prophet_forecast(
+            df=df, 
+            ds_col=str(ds_col), 
+            y_col=str(y_col), 
+            periods=periods, 
+            freq=freq
+        )
+        fdf = res["forecast_df"]
+
+        # User-facing table columns
+        preview = fdf.rename(
+            columns={
+                "ds": "Date", 
+                "yhat": "Forecast", 
+                "yhat_lower": "Lower", 
+                "yhat_upper": "Upper"
+            }
+        ).head(15)
+
+        st["forecast_result"] = {
+            "ds_col": res["ds_col"],
+            "y_col": res["y_col"],
+            "periods": res["periods"],
+            "freq": res["freq"],
+            "model": res["model"],
+            "forecast_df": fdf,
+        }
+        st["forecast_preview"] = preview
+        st.setdefault("messages", []).append(
+            {
+                "role": "assistant",
+                "content": (
+                    "✅ Forecast completed successfully.\n\n"
+                    "Here are the forecasted values based on your settings.\n\n"
+                    "__show_forecast__"
+                ),
+            }
+        )
+
+        st["history"].append(
+            {
+                "tool": "forecast_with_prophet", 
+                "status": "finished", 
+                "periods": periods, 
+                "freq": res["freq"]
+            }
+        )
+    except Exception as e:
+        st["errors"].append(f"forecast_with_prophet: {e}")
+        st["history"].append({"tool": "forecast_with_prophet", "status": "failed"})
 
     return st

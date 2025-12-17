@@ -307,6 +307,48 @@ class ChatOrchestrator:
                 return cols[idx]
 
         return None
+    
+    def _parse_forecast_horizon(self, text: str) -> Optional[Dict[str, Any]]:
+        """
+        Examples:
+          - 'monthly for 5 months'
+          - 'next 30 days'
+          - 'yearly forecast for 3 years'
+        """
+        t = text.lower()
+
+        freq_map = {
+            "daily": "D",
+            "day": "D",
+            "days": "D",
+            "weekly": "W",
+            "week": "W",
+            "weeks": "W",
+            "monthly": "MS",
+            "month": "MS",
+            "months": "MS",
+            "yearly": "YS",
+            "year": "YS",
+            "years": "YS",
+        }
+
+        freq = None
+        for k, v in freq_map.items():
+            if k in t:
+                freq = v
+                break
+
+        import re
+        m = re.search(r"(\d+)", t)
+        periods = int(m.group(1)) if m else None
+
+        if not freq or not periods:
+            return None
+
+        return {
+            "forecast_freq": freq,
+            "forecast_periods": periods,
+        }
 
     
     def _run_baseline_training(self, st: Dict[str, Any], target_col: str) -> Dict[str, Any]:
@@ -765,26 +807,97 @@ class ChatOrchestrator:
         return st
     
     def advance_plan(self, st: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Execute exactly ONE step from the approved plan.
-        """
         st.setdefault("messages", [])
         steps = st.get("plan_steps", [])
-        cursor = st.get("plan_cursor", 0)
+        cursor = int(st.get("plan_cursor", 0))
 
         if cursor >= len(steps):
             st["stage"] = "idle"
             st["messages"].append(
-                {"role": "assistant", "content": "✅ Plan completed."}
+                {
+                    "role": "assistant",
+                    "content": "Plan completed.",
+                }
             )
             return st
 
         step = steps[cursor]
 
+        # ---------------- PREPROCESS ----------------
         if step == "preprocess":
             st["want_preprocess"] = True
+            st["plan_cursor"] = cursor + 1
+            return st
+        
+        # ---------------- CONFIRM FORECAST HORIZON ----------------
+        if step == "confirm_forecast_horizon":
+            if st.get("forecast_freq") and st.get("forecast_periods"):
+                st["plan_cursor"] = cursor + 1
+                return st
 
-        elif step == "confirm_target":
+            st["stage"] = "await_forecast_horizon"
+            st["messages"].append(
+                {
+                    "role": "assistant",
+                    "content": (
+                        "How far do you want to forecast?\n\n"
+                        "Examples:\n"
+                        "• monthly for next 5 months\n"
+                        "• daily for 30 days\n"
+                        "• yearly for 3 years"
+                    ),
+                }
+            )
+            return st
+
+        # ---------------- CONFIRM DS ----------------
+        if step == "confirm_ds":
+            if st.get("ds_col"):
+                st["plan_cursor"] = cursor + 1
+                return st
+
+            st["stage"] = "await_ds"
+            st["messages"].append(
+                {
+                    "role": "assistant",
+                    "content": "Which column is the date/time column? (this will be ds)",
+                }
+            )
+            return st
+
+        # ---------------- CONFIRM Y ----------------
+        if step == "confirm_y":
+            if st.get("y_col"):
+                st["plan_cursor"] = cursor + 1
+                st["stage"] = "executing_plan"
+                return st
+
+            st["stage"] = "await_y"
+            st["messages"].append(
+                {
+                    "role": "assistant",
+                    "content": "Which numeric column do you want to forecast? (this will be y)",
+                }
+            )
+            return st
+
+        # ---------------- FORECAST ----------------
+        if step == "forecast":
+            if not st.get("ds_col") or not st.get("y_col"):
+                st["errors"].append("Forecast called without ds/y.")
+                st["stage"] = "idle"
+                return st
+            
+            st["want_forecast"] = True
+            st["plan_cursor"] = cursor + 1
+            return st
+
+        # ---------------- CONFIRM TARGET ----------------
+        if step == "confirm_target":
+            if st.get("target_col"):
+                st["plan_cursor"] = cursor + 1
+                return st
+
             st["stage"] = "await_target"
             st["messages"].append(
                 {
@@ -792,31 +905,135 @@ class ChatOrchestrator:
                     "content": "Which column should be used as the target?",
                 }
             )
-            return st  # pause plan here
+            return st
 
-        elif step == "train":
+        # ---------------- TRAIN ----------------
+        if step == "train":
             st["want_train"] = True
+            st["plan_cursor"] = cursor + 1
+            return st
 
-        elif step == "tune":
+        # ---------------- TUNE ----------------
+        if step == "tune":
             st["want_tune"] = True
+            st["plan_cursor"] = cursor + 1
+            return st
 
-        elif step == "preview":
+        # ---------------- PREVIEW ----------------
+        if step == "preview":
             st["show_only_preview"] = True
+            st["plan_cursor"] = cursor + 1
+            return st
 
-        st["plan_cursor"] = cursor + 1
         return st
 
+    def _parse_column_from_text(self, text: str, st: Dict[str, Any]) -> Optional[str]:
+        if not text:
+            return None
+        t_raw = text.strip()
+        if not t_raw:
+            return None
+        t = t_raw.lower()
+
+        df: Optional[pd.DataFrame] = None
+        if isinstance(st.get("pre_df"), pd.DataFrame):
+            df = st["pre_df"]
+        elif isinstance(st.get("clean_df"), pd.DataFrame):
+            df = st["clean_df"]
+
+        if df is None:
+            return None
+
+        cols = list(df.columns)
+        cols_lower = [c.lower() for c in cols]
+
+        # exact column name
+        if t in cols_lower:
+            return cols[cols_lower.index(t)]
+
+        # contains column name
+        for c in cols:
+            if c.lower() in t:
+                return c
+
+        # token match
+        tokens = t.replace(",", " ").replace(".", " ").split()
+        for tok in tokens:
+            if tok in cols_lower:
+                return cols[cols_lower.index(tok)]
+
+        return None
+
+    def _execute_plan_until_pause(self, st: Dict[str, Any]) -> Dict[str, Any]:
+        while True:
+            stage = st.get("stage")
+
+            # --------------------------------------------------
+            # 1) Pause immediately if user input is required
+            # --------------------------------------------------
+            if stage in {
+                "await_forecast_horizon",
+                "await_ds", 
+                "await_y", 
+                "await_target"
+            }:
+                return st
+
+            prev_cursor = int(st.get("plan_cursor", 0))
+
+            # --------------------------------------------------
+            # 2) Advance ONE plan step
+            # --------------------------------------------------
+            st = self.advance_plan(st)
+
+            # --------------------------------------------------
+            # 3) If a runnable flag is set → RUN GRAPH ONCE
+            # --------------------------------------------------
+            ran_something = False
+
+            if (
+                st.get("want_preprocess")
+                or st.get("want_train")
+                or st.get("want_tune")
+                or st.get("want_forecast")
+            ):
+                st["approved"] = True
+                st = run_automl_graph(st)
+                ran_something = True
+
+                # clear flags AFTER execution
+                st["want_preprocess"] = False
+                st["want_train"] = False
+                st["want_tune"] = False
+                st["want_forecast"] = False
+
+            # --------------------------------------------------
+            # 4) HARD STOP after forecast
+            # --------------------------------------------------
+            if ran_something and st.get("forecast_result") is not None:
+                st["stage"] = "idle"
+                return st
+
+            # --------------------------------------------------
+            # 5) Safety: stop if cursor did not move
+            # --------------------------------------------------
+            if (
+                int(st.get("plan_cursor", 0)) == prev_cursor
+                and not ran_something
+                and st.get("stage") not in {"await_ds", "await_y", "await_target"}
+            ):
+                st["stage"] = "idle"
+                return st
+
+            # --------------------------------------------------
+            # 6) Plan fully consumed → stop forever
+            # --------------------------------------------------
+            if int(st.get("plan_cursor", 0)) >= len(st.get("plan_steps", [])):
+                st["stage"] = "idle"
+                return st
+
+
     def handle(self, user_text: str, state: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Production-ready conversation brain.
-
-        Flow:
-        user → intent_router → intent_normalizer → planner → approval → execution
-
-        Golden rule:
-        ANY state-changing request must be planned first.
-        """
-
         st = state.copy()
         st.setdefault("messages", [])
         st.setdefault("stage", "await_upload")
@@ -825,69 +1042,133 @@ class ChatOrchestrator:
         st.setdefault("history", [])
         st.setdefault("errors", [])
 
-        text_raw = (user_text or "").strip()
-        if not text_raw:
+        text = (user_text or "").strip()
+        if not text:
             return st
 
-        # ---------------- Approval gate ----------------
+        # ======================================================
+        # 1) PLAN APPROVAL → EXECUTE
+        # ======================================================
         if st.get("stage") == "plan_proposed":
-            return self.planner.handle_confirmation(text_raw, st)
+            st = self.planner.handle_confirmation(text, st)
+            if st.get("stage") == "executing_plan":
+                return self._execute_plan_until_pause(st)
+            return st
         
-        if st.get("stage") == "executing_plan":
-            st = self.advance_plan(st)
+        if st.get("stage") in {"idle", "preview_download"}:
+            horizon = self._parse_forecast_horizon(text)
+            if horizon:
+                st.update(horizon)
+                return self.planner.handle_multi_step(
+                    user_text=text,
+                    state=st,
+                    intent={
+                        "kind": "plan",
+                        "actions": ["forecast"],
+                        "reason": "Forecast horizon detected",
+                    },
+                )        
 
-            # Run graph ONLY if something was scheduled
-            if st.get("want_preprocess") or st.get("want_train") or st.get("want_tune"):
-                return run_automl_graph(st)
+        # ======================================================
+        # 2) USER INPUT FOR CONFIRM STEPS (FIXED)
+        # ======================================================
+        if st.get("stage") in {
+            "await_forecast_horizon",
+            "await_ds",
+            "await_y",
+            "await_target",
+        }:
+            
+            # ---------- CONFIRM FORECAST HORIZON ----------
+            if st["stage"] == "await_forecast_horizon":
+                parsed = self._parse_forecast_horizon(text)
+                if not parsed:
+                    st["messages"].append(
+                        {
+                            "role": "assistant",
+                            "content": (
+                                "I couldn’t understand that.\n\n"
+                                "Please say something like:\n"
+                                "• monthly for 5 months\n"
+                                "• daily for 30 days\n"
+                                "• yearly for 3 years"
+                            ),
+                        }
+                    )
+                    return st
+                
+                st["forecast_freq"] = parsed["forecast_freq"]
+                st["forecast_periods"] = parsed["forecast_periods"]
 
-            return st  # paused (e.g. waiting for target)
+                st["plan_cursor"] = int(st.get("plan_cursor", 0)) + 1
+                st["stage"] = "executing_plan"
 
-        # Intent detection
-        raw_intent = self.intent_router.classify(text_raw, st)
+                return self._execute_plan_until_pause(st)
+            
+            col = self._parse_column_from_text(text, st)
 
-        # Intent normalization
+            if not col:
+                st["messages"].append(
+                    {
+                        "role": "assistant",
+                        "content": "I couldn’t match that to a column name. Please try again.",
+                    }
+                )
+                return st
+
+            # 🔴 CRITICAL FIX: consume confirm step
+            st["plan_cursor"] = int(st.get("plan_cursor", 0)) + 1
+
+            if st["stage"] == "await_ds":
+                st["ds_col"] = col
+                st["stage"] = "executing_plan"
+
+            elif st["stage"] == "await_y":
+                st["y_col"] = col
+                st["stage"] = "executing_plan"
+
+            elif st["stage"] == "await_target":
+                st["target_col"] = col
+                st["stage"] = "executing_plan"
+
+            return self._execute_plan_until_pause(st)
+
+        # ======================================================
+        # 3) QA
+        # ======================================================
+        if st.get("stage") in {None, "idle", "preview_download"} and self._looks_like_qa(text):
+            answer = self._qa_answer(text, st)
+            st["messages"].append(
+                {"role": "assistant", "content": answer}
+            )
+            return st
+
+        # ======================================================
+        # 4) INTENT → PLAN
+        # ======================================================
+        raw_intent = self.intent_router.classify(text, st)
         safe_intent = self.intent_normalizer.normalize(
             raw_intent=raw_intent,
             state=st,
-            user_text=text_raw,
+            user_text=text,
         )
 
-        kind = safe_intent.kind
-        actions = safe_intent.actions
+        if safe_intent.kind == "confirm":
+            return self.planner.handle_confirmation(text, st)
 
-        if kind == "confirm":
-            return self.planner.handle_confirmation(text_raw, st)
-
-        # QA is allowed immediately
-        if kind == "qa":
-            answer = self._qa_answer(text_raw, st)
-            st["messages"].append({"role": "assistant", "content": answer})
-            return st
-
-        # EVERYTHING ELSE → PLAN FIRST
-        if kind == "plan":
-            intent_payload = {
-                "kind": kind,
-                "actions": actions,
-                "reason": safe_intent.reason,
-            }
+        if safe_intent.kind == "plan":
             return self.planner.handle_multi_step(
-                user_text=text_raw,
+                user_text=text,
                 state=st,
-                intent=intent_payload,
+                intent={
+                    "kind": safe_intent.kind,
+                    "actions": safe_intent.actions,
+                    "reason": safe_intent.reason,
+                },
             )
 
-        # Safe fallback
-        st["messages"].append(
-            {
-                "role": "assistant",
-                "content": (
-                    "I can help you clean the data, train a model, tune it, "
-                    "or explain what’s been done so far."
-                ),
-            }
-        )
         return st
+
 
     # -------------------- Helper messages --------------------
     def _menu_message(self, st: Dict[str, Any]) -> str:

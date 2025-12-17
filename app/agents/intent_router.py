@@ -10,87 +10,37 @@ class IntentRouter:
     Output contract:
     {
         "kind": "qa" | "simple_action" | "multi_step",
-        "actions": ["preview" | "preprocess" | "train" | "tune"],
+        "actions": ["preview" | "preprocess" | "train" | "tune" | "forecast"],
         "reason": str
     }
-
-    IMPORTANT:
-    - This class does NOT enforce prerequisites
-    - This class does NOT block execution
-    - It ONLY detects intent signals
-    - Safety + planning is handled by IntentNormalizer + Planner
     """
-
-    # ------------------------ PUBLIC API ------------------------
 
     def classify(self, text: str, state: Dict[str, Any]) -> Dict[str, Any]:
         t = (text or "").strip().lower()
 
         if not t:
-            return {
-                "kind": "simple_action",
-                "actions": [],
-                "reason": "Empty input",
-            }
+            return {"kind": "simple_action", "actions": [], "reason": "Empty input"}
 
         looks_like_question = self._looks_like_question(t)
         actions = self._extract_actions(t)
 
-        # ------------------------------------------------------------
-        # 1) STATUS / METRIC QUESTIONS → QA
-        # ------------------------------------------------------------
         if self._is_status_or_metric_question(t):
-            return {
-                "kind": "qa",
-                "actions": [],
-                "reason": "Status / metric question",
-            }
+            return {"kind": "qa", "actions": [], "reason": "Status / metric question"}
 
-        # ------------------------------------------------------------
-        # 2) PURE QUESTIONS → QA
-        # ------------------------------------------------------------
         if looks_like_question and not actions:
-            return {
-                "kind": "qa",
-                "actions": [],
-                "reason": "Pure informational question",
-            }
+            return {"kind": "qa", "actions": [], "reason": "Pure informational question"}
 
-        # ------------------------------------------------------------
-        # 3) MULTI-STEP INTENT
-        # ------------------------------------------------------------
         if self._looks_like_multi_step(t, actions):
-            return {
-                "kind": "multi_step",
-                "actions": actions,
-                "reason": "Multiple workflow actions requested",
-            }
+            return {"kind": "multi_step", "actions": actions, "reason": "Multiple workflow actions requested"}
 
-        # ------------------------------------------------------------
-        # 4) SINGLE ACTION COMMAND
-        # ------------------------------------------------------------
         if actions:
-            return {
-                "kind": "simple_action",
-                "actions": actions,
-                "reason": "Single workflow action requested",
-            }
+            return {"kind": "simple_action", "actions": actions, "reason": "Single workflow action requested"}
 
-        # ------------------------------------------------------------
-        # 5) FALLBACK → QA-ISH GUIDANCE
-        # ------------------------------------------------------------
-        return {
-            "kind": "qa",
-            "actions": [],
-            "reason": "Ambiguous input → respond safely",
-        }
-
-    # ------------------------ HELPERS ------------------------
+        return {"kind": "qa", "actions": [], "reason": "Ambiguous input → respond safely"}
 
     def _looks_like_question(self, t: str) -> bool:
         if "?" in t:
             return True
-
         starters = (
             "what", "which", "how", "why", "when", "where",
             "did", "do ", "does", "have", "has",
@@ -105,9 +55,9 @@ class IntentRouter:
             "preprocess", "preprocessed", "cleaned",
             "trained", "training",
             "tuned", "tuning",
+            "forecast", "forecasted", "prophet",
             "result", "results",
         ]
-
         metric_keywords = [
             "accuracy", "f1", "precision", "recall",
             "r2", "rmse", "mae",
@@ -115,21 +65,16 @@ class IntentRouter:
             "best model", "which model",
             "explain", "explanation",
         ]
-
         return any(k in t for k in status_keywords + metric_keywords) and self._looks_like_question(t)
 
     def _extract_actions(self, t: str) -> List[str]:
         actions: List[str] = []
 
-        # ---------------- preview ----------------
-        if any(p in t for p in [
-            "preview", "show data", "see data",
-            "show table", "see table",
-            "look at data",
-        ]):
+        # preview
+        if any(p in t for p in ["preview", "show data", "see data", "show table", "see table", "look at data"]):
             actions.append("preview")
 
-        # ---------------- preprocess ----------------
+        # preprocess
         if any(p in t for p in [
             "preprocess", "pre-processing",
             "clean data", "data cleaning",
@@ -138,7 +83,24 @@ class IntentRouter:
         ]):
             actions.append("preprocess")
 
-        # ---------------- train ----------------
+        # forecast horizon-only messages (CRITICAL FIX)
+        if any(k in t for k in ["daily", "weekly", "monthly", "yearly"]) and any(
+            x in t for x in ["day", "days", "week", "weeks", "month", "months", "year", "years"]
+        ):
+            actions.append("forecast")
+
+
+        # forecast (Prophet / time series)
+        if any(p in t for p in [
+            "forecast", "forecasting",
+            "time series", "timeseries",
+            "predict future", "predict next",
+            "prophet",
+            "future sales", "next 30 days", "next 7 days",
+        ]):
+            actions.append("forecast")
+
+        # train
         if any(p in t for p in [
             "train", "training",
             "train model", "build model",
@@ -148,7 +110,7 @@ class IntentRouter:
         ]):
             actions.append("train")
 
-        # ---------------- tune ----------------
+        # tune
         if any(p in t for p in [
             "tune", "tuning",
             "optimize", "optimization",
@@ -159,7 +121,7 @@ class IntentRouter:
         ]):
             actions.append("tune")
 
-        # Deduplicate while preserving order
+        # dedupe
         seen = set()
         uniq: List[str] = []
         for a in actions:
@@ -177,10 +139,10 @@ class IntentRouter:
             "preprocess and train",
             "clean train tune",
             "complete workflow",
+            "clean and forecast",
+            "preprocess and forecast",
+            "forecast and tune",
         ]
-
         if any(p in t for p in explicit_phrases):
             return True
-
-        # More than one action detected
         return len(actions) >= 2
