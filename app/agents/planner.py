@@ -35,6 +35,9 @@ class Planner:
         if not plan:
             plan.append("preview")
 
+        if "train" in plan and "preprocess" not in plan:
+            plan.insert(0, "preprocess")
+
         return plan
 
     def handle_multi_step(self, user_text: str, state: Dict[str, Any], intent: Dict[str, Any]) -> Dict[str, Any]:

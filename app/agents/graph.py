@@ -74,6 +74,11 @@ class AutoMLState(TypedDict, total=False):
     chosen_tune_method: Optional[Literal["bayesian", "random_search"]]
     tune_metric: Optional[str]
 
+    # Recommendation (post-upload)
+    recommended_approach: Optional[
+        Literal["forecasting", "classification", "regression"]
+    ]    
+
     # HITL / Supervisor
     require_approval: bool
     approved: bool

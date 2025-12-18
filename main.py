@@ -105,6 +105,7 @@ STATE = {
     "require_approval": False,
     "approved": False,
     "supervisor_reason": "",
+    "recommended_approach": None,
 
     # bookkeeping
     "history": [],
@@ -264,7 +265,6 @@ async def get_forecast_results():
             else STATE.get("forecast_preview")
         ),
     }
-
 
 # =========================================================
 # 7) DOWNLOAD PREPROCESSED DATA

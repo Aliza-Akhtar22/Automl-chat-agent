@@ -13,6 +13,22 @@ class NormalizedIntent:
 
 
 class IntentNormalizer:
+
+    AGREE_WITH_RECOMMENDATION = {
+    "ok proceed",
+    "okay proceed",
+    "proceed",
+    "go ahead",
+    "do it",
+    "use this",
+    "use this approach",
+    "use your suggestion",
+    "use your recommendation",
+    "sounds good",
+    "let’s do it",
+    "lets do it",
+    "yes proceed",
+    }
     YES_WORDS = {"yes", "y", "yeah", "yep", "ok", "okay", "sure", "please do", "do it", "go ahead", "proceed"}
     NO_WORDS = {"no", "n", "nope", "not now", "later", "stop", "cancel"}
 
@@ -40,7 +56,10 @@ class IntentNormalizer:
             safe_actions = self._enforce_prerequisites(safe_actions, state)
             return NormalizedIntent(kind="plan", actions=safe_actions, reason="Multi-step request → plan required")
 
-        if any(a in self.MUTATING_ACTIONS for a in actions):
+        if (
+            any(a in self.MUTATING_ACTIONS for a in actions)
+            or "confirm_target" in actions
+        ):
             safe_actions = self._normalize_actions(actions)
             safe_actions = self._enforce_prerequisites(safe_actions, state)
             return NormalizedIntent(kind="plan", actions=safe_actions, reason="State-changing request → plan first")
@@ -48,7 +67,7 @@ class IntentNormalizer:
         if "preview" in actions:
             return NormalizedIntent(kind="plan", actions=["preview"], reason="Preview may trigger preprocessing → plan first")
 
-        return NormalizedIntent(kind="qa", actions=[], reason="No deterministic action detected")
+        return NormalizedIntent(kind=kind, actions=actions, reason=reason or "No deterministic action detected")
 
     def _normalize_actions(self, actions: List[str]) -> List[str]:
         seen = set()
@@ -80,8 +99,8 @@ class IntentNormalizer:
             if not preprocessing_done and "preprocess" not in out:
                 out.insert(0, "preprocess")
             if "confirm_target" not in out:
-                train_idx = out.index("train") if "train" in out else len(out)
-                out.insert(train_idx, "confirm_target")
+                idx = out.index("train") if "train" in out else len(out)
+                out.insert(idx, "confirm_target")
 
         if "tune" in out and "train" not in out:
             idx = out.index("tune")

@@ -61,6 +61,21 @@ class ChatOrchestrator:
             temperature=0.2,
         )
 
+        # Extract RECOMMENDED APPROACH from LLM response
+        para_lower = para.lower()
+
+        recommended = None
+
+        if "recommended approach" in para_lower:
+            if "classification" in para_lower:
+                recommended = "classification"
+            elif "regression" in para_lower:
+                recommended = "regression"
+            elif "forecast" in para_lower or "time series forecasting" in para_lower:
+                recommended = "forecasting"
+
+        st["recommended_approach"] = recommended
+
         st["messages"].append(
             {
                 "role": "assistant",
@@ -978,6 +993,13 @@ class ChatOrchestrator:
                 "await_target"
             }:
                 return st
+            
+    
+            if st.get("force_run_graph"):
+                st.pop("force_run_graph", None)
+                st["approved"] = True
+                st = run_automl_graph(st)
+                continue
 
             prev_cursor = int(st.get("plan_cursor", 0))
 
@@ -1045,6 +1067,8 @@ class ChatOrchestrator:
         text = (user_text or "").strip()
         if not text:
             return st
+        
+        
 
         # ======================================================
         # 1) PLAN APPROVAL → EXECUTE
@@ -1055,7 +1079,44 @@ class ChatOrchestrator:
                 return self._execute_plan_until_pause(st)
             return st
         
-        if st.get("stage") in {"idle", "preview_download"}:
+        if (
+            st.get("stage") == "post_upload_orientation"
+            and st.get("recommended_approach") in {"classification", "regression"}
+            and text.lower() in {"ok", "okay", "ok proceed", "proceed", "yes", "yes proceed"}
+        ):
+            return self.planner.handle_multi_step(
+                    user_text=text,
+                    state=st,
+                    intent={
+                        "kind": "plan",
+                        "actions": ["train"],
+                        "reason": "User accepted recommended ML approach",
+                    },
+                )
+            
+        if (
+            st.get("stage") == "post_upload_orientation"
+            and st.get("recommended_approach") == "forecasting"
+            and text.lower() in {"ok", "okay", "ok proceed", "proceed", "yes", "yes proceed"}
+        ):
+            return self.planner.handle_multi_step(
+                    user_text=text,
+                    state=st,
+                    intent={
+                        "kind": "plan",
+                        "actions": ["forecast"],
+                        "reason": "User accepted recommended forecasting approach",
+                    },
+                )
+
+
+        
+        if (
+            st.get("stage") in {"idle", "preview_download"}
+            and st.get("recommended_approach") == "forecasting"
+            and any(w in text.lower() for w in ["forecast", "time series"])
+            and st.get("task_type") is None
+        ):
             horizon = self._parse_forecast_horizon(text)
             if horizon:
                 st.update(horizon)
@@ -1065,7 +1126,7 @@ class ChatOrchestrator:
                     intent={
                         "kind": "plan",
                         "actions": ["forecast"],
-                        "reason": "Forecast horizon detected",
+                        "reason": "Explicit forecast request",
                     },
                 )        
 
@@ -1129,12 +1190,16 @@ class ChatOrchestrator:
 
             elif st["stage"] == "await_target":
                 st["target_col"] = col
+                
+                st["want_train"] = True
+                st["approved"] = True
+                st["force_run_graph"] = True
                 st["stage"] = "executing_plan"
 
             return self._execute_plan_until_pause(st)
 
         # ======================================================
-        # 3) QA
+        # 4) QA
         # ======================================================
         if st.get("stage") in {None, "idle", "preview_download"} and self._looks_like_qa(text):
             answer = self._qa_answer(text, st)
@@ -1144,7 +1209,7 @@ class ChatOrchestrator:
             return st
 
         # ======================================================
-        # 4) INTENT → PLAN
+        # 5) INTENT → PLAN
         # ======================================================
         raw_intent = self.intent_router.classify(text, st)
         safe_intent = self.intent_normalizer.normalize(
