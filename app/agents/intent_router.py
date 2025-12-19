@@ -1,6 +1,6 @@
 # app/agents/intent_router.py
 from __future__ import annotations
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 
 class IntentRouter:
@@ -11,9 +11,26 @@ class IntentRouter:
     {
         "kind": "qa" | "simple_action" | "multi_step",
         "actions": ["preview" | "preprocess" | "train" | "tune" | "forecast"],
-        "reason": str
+        "reason": str,
+        "requested_model": Optional[str]   # NEW (only when user specifies a model)
     }
     """
+
+    MODEL_ALIASES = {
+        "random forest": "RandomForest",
+        "randomforest": "RandomForest",
+        "rf": "RandomForest",
+        "logistic regression": "LogisticRegression",
+        "logistic": "LogisticRegression",
+        "linear regression": "LinearRegression",
+        "linear": "LinearRegression",
+        "xgboost": "XGBoost",
+        "xgb": "XGBoost",
+        "catboost": "CatBoost",
+        "knn": "KNN",
+        "k nearest neighbors": "KNN",
+        "k-nearest neighbors": "KNN",
+    }
 
     def classify(self, text: str, state: Dict[str, Any]) -> Dict[str, Any]:
         t = (text or "").strip().lower()
@@ -23,6 +40,15 @@ class IntentRouter:
 
         looks_like_question = self._looks_like_question(t)
         actions = self._extract_actions(t)
+        requested_model = self._extract_requested_model(t)
+        
+        if requested_model:
+            return {
+                "kind": "simple_action",
+                "actions": ["train"],
+                "reason": f"User explicitly requested training with {requested_model}",
+                "requested_model": requested_model,
+            }        
 
         if self._is_status_or_metric_question(t):
             return {"kind": "qa", "actions": [], "reason": "Status / metric question"}
@@ -37,6 +63,16 @@ class IntentRouter:
             return {"kind": "simple_action", "actions": actions, "reason": "Single workflow action requested"}
 
         return {"kind": "qa", "actions": [], "reason": "Ambiguous input → respond safely"}
+    
+    def _extract_requested_model(self, t: str) -> Optional[str]:
+        """
+        Detect if the user explicitly mentions a specific ML model.
+        This is DISPLAY-ONLY intent; training behavior remains unchanged.
+        """
+        for phrase, model_key in self.MODEL_ALIASES.items():
+            if phrase in t:
+                return model_key
+        return None    
 
     def _looks_like_question(self, t: str) -> bool:
         if "?" in t:
@@ -79,7 +115,7 @@ class IntentRouter:
             "preprocess", "pre-processing",
             "clean data", "data cleaning",
             "handle missing", "fix missing",
-            "drop duplicates", "clean the data",
+            "drop duplicates", "clean the data", "clean",
         ]):
             actions.append("preprocess")
 
@@ -95,7 +131,7 @@ class IntentRouter:
             "forecast", "forecasting",
             "time series", "timeseries",
             "predict future", "predict next",
-            "prophet",
+            "prophet", "prophet model",
             "future sales", "next 30 days", "next 7 days",
         ]):
             actions.append("forecast")

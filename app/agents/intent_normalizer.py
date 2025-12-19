@@ -38,6 +38,7 @@ class IntentNormalizer:
         kind = (raw_intent.get("kind") or "simple_action").strip()
         actions = list(raw_intent.get("actions") or [])
         reason = raw_intent.get("reason", "")
+        requested_model = raw_intent.get("requested_model")
         t = (user_text or "").strip().lower()
 
         stage = state.get("stage")
@@ -54,6 +55,8 @@ class IntentNormalizer:
         if kind == "multi_step":
             safe_actions = self._normalize_actions(actions)
             safe_actions = self._enforce_prerequisites(safe_actions, state)
+            if requested_model:
+                state["requested_model"] = requested_model
             return NormalizedIntent(kind="plan", actions=safe_actions, reason="Multi-step request → plan required")
 
         if (
@@ -62,6 +65,8 @@ class IntentNormalizer:
         ):
             safe_actions = self._normalize_actions(actions)
             safe_actions = self._enforce_prerequisites(safe_actions, state)
+            if requested_model:
+                state["requested_model"] = requested_model
             return NormalizedIntent(kind="plan", actions=safe_actions, reason="State-changing request → plan first")
 
         if "preview" in actions:

@@ -24,14 +24,23 @@ from app.agents.intent_router import IntentRouter
 from app.agents.planner import Planner
 from app.agents.intent_normalizer import IntentNormalizer
 
-
-
-
 class ChatOrchestrator:
     def __init__(self) -> None:
         self.intent_router = IntentRouter()
         self.planner = Planner()
         self.intent_normalizer = IntentNormalizer()
+
+    def _normalize_model_name(self, name: str) -> str:
+        if not name:
+            return ""
+        return (
+            name.lower()
+                .replace(" ", "")
+                .replace("_", "")
+                .replace("-", "")
+                .replace("classifier", "")
+                .replace("regressor", "")
+        )        
 
     # -------------------- Public: entry after upload --------------------
     def start_after_upload(self, df: pd.DataFrame, state: Dict[str, Any]) -> Dict[str, Any]:
@@ -492,12 +501,28 @@ class ChatOrchestrator:
         tr = out.get("train_result")
         if tr is not None and isinstance(tr.get("results"), pd.DataFrame):
             df_res = tr["results"]
+            requested = out.get("requested_model")
+            if requested and isinstance(df_res, pd.DataFrame):
+                req_norm = self._normalize_model_name(requested)
+                mask = df_res["model"].apply(
+                    lambda m: self._normalize_model_name(m) == req_norm
+                )
+                filtered = df_res[mask]
+                if not filtered.empty:
+                    df_res = filtered
+                    tr["results"] = df_res
             n_models = len(df_res)
 
             # ------------------------------
             # Save best model for download
             # ------------------------------
-            best_model_name = out.get("best_model_name")
+            if not df_res.empty:
+                try:
+                    best_model_name = df_res.iloc[0]["model"]
+                    out["best_model_name"] = best_model_name
+                    out["best_model_row"] = df_res.iloc[0].to_dict()
+                except Exception:
+                    pass
 
             # Fallback (rare): if tool didn't set name, try to pick from results safely
             if not best_model_name and not df_res.empty:
