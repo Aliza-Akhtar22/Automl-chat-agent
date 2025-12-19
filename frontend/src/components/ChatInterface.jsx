@@ -1,91 +1,66 @@
-// ChatInterface.jsx
-import React, { useState, useRef, useEffect } from "react";
+import React, { useState } from "react";
 import "./ChatInterface.css";
 
 const API = "http://127.0.0.1:8000";
 
 const ChatInterface = () => {
-  const [messages, setMessages] = useState([
-    {
-      text: "Hi 👋 Upload a CSV to get started.",
-      sender: "bot",
-      timestamp: new Date(),
-    },
-  ]);
-
-  const [inputText, setInputText] = useState("");
+  const [messages, setMessages] = useState([]);
+  const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
-  const [isUploading, setIsUploading] = useState(false);
-  const [selectedFile, setSelectedFile] = useState(null);
-
+  const [file, setFile] = useState(null);
   const [rawPreview, setRawPreview] = useState(null);
-  const [trainResult, setTrainResult] = useState(null);
-  const [forecastResult, setForecastResult] = useState(null);
+  const [isUploading, setIsUploading] = useState(false);
 
-  const messagesEndRef = useRef(null);
-
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, rawPreview, trainResult, forecastResult]);
-
-  // ---------------- Upload ----------------
-  const handleUpload = async () => {
-    if (!selectedFile) return;
+  // ======================
+  // Upload CSV
+  // ======================
+  const uploadCSV = async () => {
+    if (!file) return;
 
     setIsUploading(true);
+    setMessages([]);
     setRawPreview(null);
-    setTrainResult(null);
-    setForecastResult(null);
+
+    const formData = new FormData();
+    formData.append("file", file);
 
     try {
-      const fd = new FormData();
-      fd.append("file", selectedFile);
-
-      const res = await fetch(`${API}/upload_csv`, {
+      // 1️⃣ Upload CSV
+      await fetch(`${API}/upload_csv`, {
         method: "POST",
-        body: fd,
+        body: formData,
       });
 
-      const data = await res.json();
-
-      const botMessages = data.messages
-        .filter((m) => m.role === "assistant")
-        .map((m) => ({
-          text: m.content,
-          sender: "bot",
-          timestamp: new Date(),
-        }));
-
-      setMessages([
-        {
-          text: `📄 Uploaded file: ${selectedFile.name}`,
-          sender: "bot",
-          timestamp: new Date(),
-        },
-        ...botMessages,
-      ]);
-
+      // 2️⃣ Fetch raw preview
       const previewRes = await fetch(`${API}/raw_preview`);
       const previewData = await previewRes.json();
       setRawPreview(previewData);
+
+      // 3️⃣ Get initial assistant message
+      const chatRes = await fetch(`${API}/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: "" }),
+      });
+      const chatData = await chatRes.json();
+
+      setMessages([{ sender: "bot", text: chatData.reply }]);
+    } catch {
+      setMessages([{ sender: "bot", text: "❌ CSV upload failed." }]);
     } finally {
       setIsUploading(false);
     }
   };
 
-  // ---------------- Chat ----------------
-  const handleSend = async (e) => {
-    e.preventDefault();
-    if (!inputText.trim()) return;
+  // ======================
+  // Send Chat
+  // ======================
+  const sendMessage = async () => {
+    if (!input.trim()) return;
 
-    const userMsg = {
-      text: inputText,
-      sender: "user",
-      timestamp: new Date(),
-    };
-
+    const userMsg = { sender: "user", text: input };
     setMessages((prev) => [...prev, userMsg]);
-    setInputText("");
+    setInput("");
     setIsLoading(true);
 
     try {
@@ -96,133 +71,77 @@ const ChatInterface = () => {
       });
 
       const data = await res.json();
-
-      setMessages((prev) => [
-        ...prev,
-        {
-          text: data.reply,
-          sender: "bot",
-          timestamp: new Date(),
-        },
-      ]);
-
-      // ---- TRY TRAIN RESULTS ----
-      try {
-        const tr = await fetch(`${API}/train_results`);
-        if (tr.ok) {
-          const tData = await tr.json();
-          setTrainResult(tData);
-        }
-      } catch {}
-
-      // ---- TRY FORECAST RESULTS ----
-      try {
-        const fr = await fetch(`${API}/forecast_results`);
-        if (fr.ok) {
-          const fData = await fr.json();
-          setForecastResult(fData);
-        }
-      } catch {}
+      setMessages((prev) => [...prev, { sender: "bot", text: data.reply }]);
     } finally {
       setIsLoading(false);
     }
   };
 
-  // ---------------- Table Renderer ----------------
-  const renderTable = (columns, rows) => (
-    <table>
-      <thead>
-        <tr>
-          {columns.map((c) => (
-            <th key={c}>{c}</th>
-          ))}
-        </tr>
-      </thead>
-      <tbody>
-        {rows.map((r, i) => (
-          <tr key={i}>
-            {columns.map((c) => (
-              <td key={c}>{r[c]}</td>
-            ))}
-          </tr>
-        ))}
-      </tbody>
-    </table>
-  );
-
   return (
-    <div className="chat-container">
-      <header className="chat-header">
-        <h1>AI Assistant</h1>
-      </header>
-
-      {/* Upload */}
-      <div className="upload-bar">
-        <input
-          type="file"
-          accept=".csv"
-          onChange={(e) => setSelectedFile(e.target.files[0])}
-          disabled={isUploading || isLoading}
-        />
-        <button onClick={handleUpload} disabled={!selectedFile || isUploading}>
-          Upload CSV
-        </button>
+    <div className="chat-root">
+      {/* TOP BAR */}
+      <div className="top-bar">
+        <div className="upload-controls">
+          <input type="file" accept=".csv" onChange={(e) => setFile(e.target.files[0])} />
+          <button onClick={uploadCSV}>Upload CSV</button>
+        </div>
+        <div className="title">AI Assistant</div>
       </div>
 
-      <div className="messages-area">
-        {messages.map((m, i) => (
-          <div key={i} className={`message-bubble ${m.sender}`}>
-            {m.text}
-          </div>
-        ))}
+      {/* CHAT */}
+      <div className="chat-body">
+        <div className="messages-area">
 
-        {/* RAW PREVIEW */}
-        {rawPreview && (
-          <div className="table-block">
-            <h3>Raw data preview (first 15 rows)</h3>
-            {renderTable(rawPreview.columns, rawPreview.rows)}
-          </div>
-        )}
+          {isUploading && (
+            <div className="system-hint">Uploading dataset… ⏳</div>
+          )}
 
-        {/* TRAIN RESULTS */}
-        {trainResult && (
-          <div className="table-block">
-            <h3>Training leaderboard</h3>
-            {renderTable(
-              Object.keys(trainResult.leaderboard[0]),
-              trainResult.leaderboard
-            )}
-            <p>{trainResult.explanation}</p>
-          </div>
-        )}
+          {/* RAW DATA PREVIEW TABLE */}
+          {rawPreview && (
+            <div className="table-wrapper">
+              <div className="table-title">Raw Data Preview</div>
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    {rawPreview.columns.map((col) => (
+                      <th key={col}>{col}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {rawPreview.rows.map((row, i) => (
+                    <tr key={i}>
+                      {rawPreview.columns.map((col) => (
+                        <td key={col}>{row[col]}</td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
 
-        {/* FORECAST RESULTS */}
-        {forecastResult && (
-          <div className="table-block">
-            <h3>
-              Forecast Results ({forecastResult.meta.ds_col} →{" "}
-              {forecastResult.meta.y_col})
-            </h3>
-            {renderTable(
-              ["Date", "Forecast", "Lower", "Upper"],
-              forecastResult.preview
-            )}
-          </div>
-        )}
+          {/* CHAT MESSAGES */}
+          {messages.map((msg, i) => (
+            <div key={i} className={`message ${msg.sender}`}>
+              {msg.text}
+            </div>
+          ))}
 
-        {isLoading && <div className="message-bubble bot">Typing…</div>}
-        <div ref={messagesEndRef} />
+          {isLoading && <div className="message bot">Typing…</div>}
+        </div>
+
+        {/* INPUT */}
+        <div className="input-area">
+          <input
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            placeholder="Type a message..."
+            onKeyDown={(e) => e.key === "Enter" && sendMessage()}
+          />
+          <button onClick={sendMessage}>Send</button>
+        </div>
       </div>
-
-      {/* Input */}
-      <form className="input-area" onSubmit={handleSend}>
-        <input
-          value={inputText}
-          onChange={(e) => setInputText(e.target.value)}
-          placeholder="Type a message..."
-        />
-        <button type="submit">▶</button>
-      </form>
     </div>
   );
 };

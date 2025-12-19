@@ -137,7 +137,7 @@ def build_preview(df: pd.DataFrame) -> dict:
     - first 15 rows
     - NaN / NaT / inf → null
     """
-    head = df.head(15).copy()
+    head = df.head(10).copy()
     head = head.replace([np.inf, -np.inf], np.nan)
     rows = json.loads(head.to_json(orient="records"))
 
