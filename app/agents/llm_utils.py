@@ -33,5 +33,5 @@ def chat_json(
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        # best-effort: wrap it
+        
         return {"raw": text}

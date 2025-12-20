@@ -75,7 +75,7 @@ def safe_train_test_split(X, y, test_size=0.2, stratify=True, random_state=RANDO
 
 
 # -----------------------------------------------------
-#  Imbalance handling (SMOTE or class weights)
+#  Imbalance handling 
 # -----------------------------------------------------
 def handle_imbalance(X_train, y_train, task_type: str):
     """
@@ -119,7 +119,7 @@ def cross_val_metrics(model, X_train, y_train, task_type: str, folds: int = 5):
 
     n = len(X_train)
     if n > 100_000:
-        folds = 3  # reduce CV load
+        folds = 3  # CV load
 
     try:
         if task_type == "classification":
@@ -226,7 +226,7 @@ def inverse_transform_if_possible(arr, encoder):
 
 
 # =====================================================
-# NEW: Metric helpers for defaulted tuning
+# Metric helpers for defaulted tuning
 # =====================================================
 
 _CLASS_METRICS = {"f1", "accuracy", "precision", "recall"}
@@ -301,7 +301,7 @@ def metric_to_sklearn_scorer(task_type: str, metric: Optional[str]) -> str:
         return mapping.get(m, "f1_weighted")
 
     # regression
-    # sklearn >= 1.3 supports 'neg_root_mean_squared_error'; otherwise 'neg_mean_squared_error'
+    
     if m == "r2":
         return "r2"
     if m == "mae":

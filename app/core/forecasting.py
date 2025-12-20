@@ -53,7 +53,7 @@ def run_prophet_forecast(
     if y_col not in df.columns:
         raise ValueError(f"y_col not found in dataframe: {y_col}")
 
-    # -------------------- Lazy import --------------------
+    #
     try:
         from prophet import Prophet  # type: ignore
     except Exception as e:
@@ -82,7 +82,7 @@ def run_prophet_forecast(
         .reset_index(drop=True)
     )
 
-    # -------------------- Frequency handling (CRITICAL FIX) --------------------
+    # -------------------- Frequency handling --------------------
     if freq is None:
         freq = _infer_freq(prophet_df["ds"])
 

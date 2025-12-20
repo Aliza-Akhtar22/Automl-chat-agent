@@ -67,7 +67,7 @@ def build_models(task_type: str):
             ("KNNClassifier", KNeighborsClassifier(), "knn"),
         ])
 
-        # Optional Boosters
+       
         try:
             from xgboost import XGBClassifier
             models.append(("XGBoostClassifier", XGBClassifier(random_state=RANDOM_STATE, n_estimators=200, eval_metric="mlogloss"), "tree"))

@@ -95,7 +95,7 @@ def _build_pipeline(X, model_name: str, task_type: str, params: Dict[str, Any] =
 def tune_with_optuna(
     X_train, y_train, X_test, y_test,
     task_type: str, model_name: str,
-    n_trials: int = 40,                           # DEFAULT CHANGED: 40 trials
+    n_trials: int = 40,                           # DEFAULT CHANGED: 30-40 trials
     timeout: Optional[int] = None,
     direction: Optional[str] = None,              # derive from metric if None
     seed: int = RANDOM_STATE,
