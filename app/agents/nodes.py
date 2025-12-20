@@ -16,7 +16,7 @@ from app.core.utils import detect_task_type
 
 
 # =========================================================
-# 🔧 PREPROCESS TOOL
+# PREPROCESS TOOL
 # =========================================================
 def preprocess_tool(
     df: pd.DataFrame,
@@ -69,7 +69,7 @@ def preprocess_tool(
 
 
 # =========================================================
-# ⚙️ BASELINE TRAINING TOOL
+# BASELINE TRAINING TOOL
 # =========================================================
 def baseline_training_tool(X: pd.DataFrame, y: pd.Series, task_type: str) -> Dict[str, Any]:
     """
@@ -79,7 +79,7 @@ def baseline_training_tool(X: pd.DataFrame, y: pd.Series, task_type: str) -> Dic
 
 
 # =========================================================
-# 🧠 TASK TYPE DETECTION (fixed)
+# TASK TYPE DETECTION (fixed)
 # =========================================================
 def choose_task_type(y: Any) -> Optional[str]:
     """
@@ -89,21 +89,21 @@ def choose_task_type(y: Any) -> Optional[str]:
       - y is accidentally a DataFrame (multiple columns)
       - y is empty or None
     """
-    # ✅ Handle None or empty values
+    # Handle None or empty values
     if y is None:
         return None
 
-    # ✅ If DataFrame is passed instead of Series, pick the first column
+    # If DataFrame is passed instead of Series, pick the first column
     if isinstance(y, pd.DataFrame):
         if y.shape[1] == 0:
             return None
         y = y.iloc[:, 0]
 
-    # ✅ Handle empty Series
+    # Handle empty Series
     if getattr(y, "empty", False):
         return None
 
-    # ✅ Call the actual detector
+    # Call the actual detector
     try:
         return detect_task_type(y)
     except Exception as e:
